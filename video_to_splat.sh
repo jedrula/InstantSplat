@@ -48,7 +48,6 @@ if [[ ! -f "$VIDEO" ]]; then
     exit 1
 fi
 
-# Default scene name = video filename without extension
 if [[ -z "$SCENE" ]]; then
     SCENE="$(basename "$VIDEO" | sed 's/\.[^.]*$//')"
 fi
@@ -56,41 +55,35 @@ fi
 SCENE_DIR="$REPO/assets/examples/$SCENE"
 IMAGE_DIR="$SCENE_DIR/images"
 MODEL_DIR="$REPO/output_infer/$SCENE"
+PLY="$MODEL_DIR/point_cloud/iteration_${ITERS}/point_cloud.ply"
 SPLAT_OUT="$MODEL_DIR/$SCENE.splat"
 
-# ── Step 0: extract frames ────────────────────────────────────────────────────
+# ── Step 1: extract frames ────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  video_to_splat: $SCENE"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
-echo "[0/4] Extracting $N_FRAMES frames from $VIDEO (start=$START)..."
+echo "[1/3] Extracting $N_FRAMES frames (start=$START)..."
 
 rm -rf "$IMAGE_DIR"
 mkdir -p "$IMAGE_DIR"
 
-# Get video duration to compute frame interval
-DURATION=$(ffprobe -v error -ss "$START" -show_entries format=duration \
-    -of csv=p=0 "$VIDEO" 2>/dev/null | awk '{printf "%.2f", $1}')
-INTERVAL=$(echo "$DURATION $N_FRAMES" | awk '{printf "%.4f", $1/$2}')
-
 ffmpeg -y -loglevel error \
     -ss "$START" \
     -i "$VIDEO" \
-    -vf "fps=1/$INTERVAL" \
+    -vf fps=1 \
     -frames:v "$N_FRAMES" \
-    -q:v 2 \
     "$IMAGE_DIR/frame_%04d.jpg"
 
-ACTUAL=$(ls "$IMAGE_DIR"/*.jpg 2>/dev/null | wc -l)
-echo "    → $ACTUAL frames saved to $IMAGE_DIR"
+echo "    → $(ls "$IMAGE_DIR"/*.jpg 2>/dev/null | wc -l) frames → $IMAGE_DIR"
 
-# ── Step 1: geometry init (MASt3R) ───────────────────────────────────────────
+# ── Step 2: geometry init + 3DGS training ────────────────────────────────────
 echo ""
-echo "[1/4] MASt3R geometry init ($N_FRAMES views)..."
+echo "[2/3] MASt3R init + 3DGS training ($ITERS iterations)..."
 mkdir -p "$MODEL_DIR"
-
 cd "$REPO"
+
 CUDA_VISIBLE_DEVICES=0 "$PYTHON" -W ignore ./init_geo.py \
     -s "$SCENE_DIR" \
     -m "$MODEL_DIR" \
@@ -100,11 +93,6 @@ CUDA_VISIBLE_DEVICES=0 "$PYTHON" -W ignore ./init_geo.py \
     --conf_aware_ranking \
     --infer_video \
     2>&1 | tee "$MODEL_DIR/01_init_geo.log"
-echo "    → done (log: $MODEL_DIR/01_init_geo.log)"
-
-# ── Step 2: 3DGS training ────────────────────────────────────────────────────
-echo ""
-echo "[2/4] Training 3DGS ($ITERS iterations)..."
 
 CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
     -s "$SCENE_DIR" \
@@ -115,50 +103,21 @@ CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
     --pp_optimizer \
     --optim_pose \
     2>&1 | tee "$MODEL_DIR/02_train.log"
-echo "    → done (log: $MODEL_DIR/02_train.log)"
 
-# ── Step 3: render ────────────────────────────────────────────────────────────
+echo "    → done"
+
+# ── Step 3: PLY → .splat ─────────────────────────────────────────────────────
 echo ""
-echo "[3/4] Rendering..."
-
-CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./render.py \
-    -s "$SCENE_DIR" \
-    -m "$MODEL_DIR" \
-    -r 1 \
-    --n_views "$N_FRAMES" \
-    --iterations "$ITERS" \
-    --infer_video \
-    2>&1 | tee "$MODEL_DIR/03_render.log"
-
-# Assemble PNG renders into video
-RENDERS="$MODEL_DIR/interp/ours_${ITERS}/renders"
-if ls "$RENDERS"/*.png &>/dev/null; then
-    ffmpeg -y -loglevel error \
-        -framerate 24 \
-        -pattern_type glob -i "$RENDERS/*.png" \
-        -c:v libx264 -pix_fmt yuv420p \
-        "$MODEL_DIR/result.mp4"
-    echo "    → video: $MODEL_DIR/result.mp4"
-fi
-echo "    → done (log: $MODEL_DIR/03_render.log)"
-
-# ── Step 4: PLY → .splat ─────────────────────────────────────────────────────
-echo ""
-echo "[4/4] Converting to .splat..."
-
-PLY="$MODEL_DIR/point_cloud/iteration_${ITERS}/point_cloud.ply"
+echo "[3/3] Converting to .splat..."
 "$PYTHON" "$REPO/ply2splat.py" "$PLY" "$SPLAT_OUT"
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║  Done!"
+echo "║  Done! $(date '+%Y-%m-%d %H:%M:%S')"
 echo "╠══════════════════════════════════════════════════════╣"
-echo "║  Splat file:  $SPLAT_OUT"
-echo "║  Video:       $MODEL_DIR/result.mp4"
+echo "║  $SPLAT_OUT"
 echo "╠══════════════════════════════════════════════════════╣"
-echo "║  View in browser — drag the splat file onto:"
-echo "║    https://antimatter15.com/splat/"
-echo "║  (or for annotations: https://playcanvas.com/supersplat/editor)"
+echo "║  Drag onto https://antimatter15.com/splat/ to view"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
