@@ -43,6 +43,8 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
     pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
     print(f'>> Inference...')
     output = inference(pairs, model, device, batch_size=1, verbose=True)
+    del model
+    torch.cuda.empty_cache()
     print(f'>> Global alignment...')
     scene = global_aligner(output, device=args.device, mode=GlobalAlignerMode.PointCloudOptimizer)
     loss = scene.compute_global_alignment(init="mst", niter=300, schedule=schedule, lr=lr, focal_avg=args.focal_avg)

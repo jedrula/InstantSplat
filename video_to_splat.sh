@@ -2,16 +2,19 @@
 # video_to_splat.sh — full pipeline: video → frames → 3DGS → .splat
 #
 # Usage:
-#   bash video_to_splat.sh <video> [options]
+#   bash video_to_splat.sh <video> --n-frames N --duration S --iters N [options]
 #
-# Options:
+# Required:
+#   --n-frames N     number of frames to extract
+#   --duration S     seconds of video to sample (controls scene size)
+#   --iters N        3DGS training iterations
+#
+# Optional:
 #   --scene NAME     scene name / output folder (default: video filename stem)
-#   --n-frames N     number of frames to extract (default: 6)
 #   --start T        start time in video, e.g. 00:00:05 (default: 0)
-#   --iters N        training iterations (default: 1000)
 #
-# Example:
-#   bash video_to_splat.sh /path/to/fpinka.mp4 --n-frames 6 --start 00:00:01 --iters 1000
+# Example (known-good for climbing wall scenes):
+#   bash video_to_splat.sh /path/to/fpinka.mp4 --n-frames 3 --duration 6 --iters 1000
 
 set -e
 
@@ -19,18 +22,19 @@ set -e
 REPO="$(cd "$(dirname "$0")" && pwd)"
 PYTHON=/home/communications/miniconda3/envs/instantsplat/bin/python
 
-# ── Defaults ─────────────────────────────────────────────────────────────────
-N_FRAMES=6
+# ── Arg parsing ──────────────────────────────────────────────────────────────
+N_FRAMES=""
+DURATION=""
+ITERS=""
 START=0
-ITERS=1000
 SCENE=""
 VIDEO=""
 
-# ── Arg parsing ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --scene)     SCENE="$2";    shift 2 ;;
         --n-frames)  N_FRAMES="$2"; shift 2 ;;
+        --duration)  DURATION="$2"; shift 2 ;;
         --start)     START="$2";    shift 2 ;;
         --iters)     ITERS="$2";    shift 2 ;;
         -*)          echo "Unknown option: $1"; exit 1 ;;
@@ -38,10 +42,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$VIDEO" ]]; then
-    echo "Usage: bash video_to_splat.sh <video> [--scene NAME] [--n-frames N] [--start T] [--iters N]"
-    exit 1
-fi
+USAGE="Usage: bash video_to_splat.sh <video> --n-frames N --duration S --iters N [--scene NAME] [--start T]"
+
+[[ -z "$VIDEO" ]]    && { echo "$USAGE"; exit 1; }
+[[ -z "$N_FRAMES" ]] && { echo "Error: --n-frames is required"; echo "$USAGE"; exit 1; }
+[[ -z "$DURATION" ]] && { echo "Error: --duration is required"; echo "$USAGE"; exit 1; }
+[[ -z "$ITERS" ]]    && { echo "Error: --iters is required";    echo "$USAGE"; exit 1; }
 
 if [[ ! -f "$VIDEO" ]]; then
     echo "Error: video not found: $VIDEO"
@@ -56,7 +62,8 @@ SCENE_DIR="$REPO/assets/examples/$SCENE"
 IMAGE_DIR="$SCENE_DIR/images"
 MODEL_DIR="$REPO/output_infer/$SCENE"
 PLY="$MODEL_DIR/point_cloud/iteration_${ITERS}/point_cloud.ply"
-SPLAT_OUT="$MODEL_DIR/$SCENE.splat"
+# Encode key params in filename so artifacts are self-describing
+SPLAT_OUT="$MODEL_DIR/${SCENE}_f${N_FRAMES}_d${DURATION}s_i${ITERS}.splat"
 
 # ── Step 1: extract frames ────────────────────────────────────────────────────
 echo ""
@@ -64,19 +71,26 @@ echo "╔═══════════════════════�
 echo "║  video_to_splat: $SCENE"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
-echo "[1/3] Extracting $N_FRAMES frames (start=$START)..."
+echo "[1/3] Extracting $N_FRAMES frames over ${DURATION}s (start=$START)..."
 
 rm -rf "$IMAGE_DIR"
 mkdir -p "$IMAGE_DIR"
 
+# Sample N_FRAMES evenly across DURATION seconds — controls scene size independently of frame count
+FPS=$(awk "BEGIN {printf \"%.4f\", $N_FRAMES / $DURATION}")
+
 ffmpeg -y -loglevel error \
     -ss "$START" \
+    -t "$DURATION" \
     -i "$VIDEO" \
-    -vf fps=1 \
+    -vf "fps=$FPS" \
     -frames:v "$N_FRAMES" \
-    "$IMAGE_DIR/frame_%04d.jpg"
+    "$IMAGE_DIR/frame_%04d.png"
 
-echo "    → $(ls "$IMAGE_DIR"/*.jpg 2>/dev/null | wc -l) frames → $IMAGE_DIR"
+ACTUAL_FRAMES=$(ls "$IMAGE_DIR"/*.png 2>/dev/null | wc -l)
+echo "    → $ACTUAL_FRAMES frames (PNG) → $IMAGE_DIR"
+
+PIPELINE_START=$(date +%s)
 
 # ── Step 2: geometry init + 3DGS training ────────────────────────────────────
 echo ""
@@ -111,10 +125,32 @@ echo ""
 echo "[3/3] Converting to .splat..."
 "$PYTHON" "$REPO/ply2splat.py" "$PLY" "$SPLAT_OUT"
 
+# ── Save run metadata ─────────────────────────────────────────────────────────
+PIPELINE_END=$(date +%s)
+ELAPSED=$(( PIPELINE_END - PIPELINE_START ))
+ELAPSED_MIN=$(awk "BEGIN {printf \"%.1f\", $ELAPSED / 60}")
+
+PARAMS_FILE="$MODEL_DIR/${SCENE}_f${N_FRAMES}_d${DURATION}s_i${ITERS}.params.json"
+cat > "$PARAMS_FILE" <<EOF
+{
+  "scene":            "$SCENE",
+  "video":            "$VIDEO",
+  "start":            "$START",
+  "duration":         $DURATION,
+  "n_frames":         $N_FRAMES,
+  "iters":            $ITERS,
+  "actual_frames":    $ACTUAL_FRAMES,
+  "splat":            "$SPLAT_OUT",
+  "render_seconds":   $ELAPSED,
+  "render_minutes":   $ELAPSED_MIN,
+  "timestamp":        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+EOF
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║  Done! $(date '+%Y-%m-%d %H:%M:%S')"
+echo "║  Done! $(date '+%Y-%m-%d %H:%M:%S')  (${ELAPSED_MIN} min)"
 echo "╠══════════════════════════════════════════════════════╣"
 echo "║  $SPLAT_OUT"
 echo "╠══════════════════════════════════════════════════════╣"
