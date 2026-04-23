@@ -57,6 +57,7 @@ def save_pose(path, quat_pose, train_cams, llffhold=2):
     
     # Convert to numpy array and save
     colmap_poses = torch.stack(colmap_poses).detach().cpu().numpy()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     np.save(path, colmap_poses)
 
 
@@ -85,7 +86,8 @@ def load_and_prepare_confidence(confidence_path, device='cuda', scale=(0.1, 1.0)
     return lr_modifiers
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
+             early_stop_patience=0, early_stop_delta=1e-5):
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -117,8 +119,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
+    best_loss = float('inf')
+    patience_counter = 0
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")    
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     start = time()
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -189,6 +193,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 progress_bar.update(10)
+
+                if early_stop_patience > 0:
+                    if ema_loss_for_log < best_loss - early_stop_delta:
+                        best_loss = ema_loss_for_log
+                        patience_counter = 0
+                    else:
+                        patience_counter += 10  # increments in iteration units
+                        if patience_counter >= early_stop_patience:
+                            progress_bar.close()
+                            print(f"\n[ITER {iteration}] Early stopping — loss plateaued for {patience_counter} iters")
+                            scene.save(iteration)
+                            save_pose(scene.model_path + f'/pose/ours_{iteration}/pose_optimized.npy', gaussians.P, train_cams_init)
+                            break
+
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -310,6 +328,10 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=True)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--early_stop_patience", type=int, default=0,
+                        help="Stop if EMA loss does not improve by early_stop_delta for this many iterations. 0 = disabled.")
+    parser.add_argument("--early_stop_delta", type=float, default=1e-5,
+                        help="Minimum loss improvement required to reset patience counter.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -324,7 +346,8 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
+             args.early_stop_patience, args.early_stop_delta)
 
     # All done
     print("\nTraining complete.")
