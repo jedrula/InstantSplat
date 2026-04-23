@@ -26,7 +26,8 @@ set -e
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 REPO="$(cd "$(dirname "$0")" && pwd)"
-PYTHON=/home/communications/miniconda3/envs/instantsplat/bin/python
+# Override INSTANTSPLAT_PYTHON env var for non-default conda locations
+PYTHON="${INSTANTSPLAT_PYTHON:-${HOME}/miniconda3/envs/instantsplat/bin/python}"
 
 # ── Arg parsing ──────────────────────────────────────────────────────────────
 N_FRAMES=""
@@ -35,20 +36,39 @@ FPS_ARG=""
 ITERS=""
 START=0
 SCENE=""
+EARLY_STOP=1
+EVENTS_FILE=""
 VIDEOS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --scene)     SCENE="$2";    shift 2 ;;
-        --n-frames)  N_FRAMES="$2"; shift 2 ;;
-        --duration)  DURATION="$2"; shift 2 ;;
-        --fps)       FPS_ARG="$2";  shift 2 ;;
-        --start)     START="$2";    shift 2 ;;
-        --iters)     ITERS="$2";    shift 2 ;;
-        -*)          echo "Unknown option: $1"; exit 1 ;;
-        *)           VIDEOS+=("$1"); shift ;;
+        --scene)        SCENE="$2";        shift 2 ;;
+        --n-frames)     N_FRAMES="$2";     shift 2 ;;
+        --duration)     DURATION="$2";     shift 2 ;;
+        --fps)          FPS_ARG="$2";      shift 2 ;;
+        --start)        START="$2";        shift 2 ;;
+        --iters)        ITERS="$2";        shift 2 ;;
+        --events-file)  EVENTS_FILE="$2";  shift 2 ;;
+        --early-stop)   EARLY_STOP=1;      shift ;;
+        --no-early-stop) EARLY_STOP=0;     shift ;;
+        -*)             echo "Unknown option: $1"; exit 1 ;;
+        *)              VIDEOS+=("$1"); shift ;;
     esac
 done
+
+# ── Event emitter ────────────────────────────────────────────────────────────
+# Usage: emit_event '{"event": "...", ...extra keys...}'
+# Automatically injects "t" (seconds since PIPELINE_START) when available.
+emit_event() {
+    [[ -z "$EVENTS_FILE" ]] && return 0
+    local payload="$1"
+    local ts=0
+    if [[ -n "${PIPELINE_START:-}" ]]; then
+        ts=$(( $(date +%s) - PIPELINE_START ))
+    fi
+    # Inject t field: strip trailing } and append ,"t":N}
+    echo "${payload%\}},\"t\":$ts}" >> "$EVENTS_FILE"
+}
 
 USAGE="Usage:
   bash video_to_splat.sh <video> [video2 ...] --scene NAME --iters N
@@ -119,10 +139,16 @@ done
 TOTAL_FRAMES=$(ls "$IMAGE_DIR"/frame_*.png 2>/dev/null | wc -l)
 echo "    → $TOTAL_FRAMES total frames (PNG) → $IMAGE_DIR"
 
-PLY="$MODEL_DIR/point_cloud/iteration_${ITERS}/point_cloud.ply"
-SPLAT_OUT="$MODEL_DIR/${SCENE}_f${TOTAL_FRAMES}_i${ITERS}.splat"
+# Use the latest saved iteration (early stop may save before ITERS)
+ACTUAL_ITER=$(ls -d "$MODEL_DIR/point_cloud/iteration_"* 2>/dev/null \
+    | grep -oP 'iteration_\K\d+' | sort -n | tail -1)
+ACTUAL_ITER=${ACTUAL_ITER:-$ITERS}
+PLY="$MODEL_DIR/point_cloud/iteration_${ACTUAL_ITER}/point_cloud.ply"
+SPLAT_OUT="$MODEL_DIR/${SCENE}_f${TOTAL_FRAMES}_i${ACTUAL_ITER}.splat"
 
 PIPELINE_START=$(date +%s)
+
+emit_event "{\"event\":\"frames_extracted\",\"total_frames\":$TOTAL_FRAMES}"
 
 # ── Step 2: geometry init + 3DGS training ────────────────────────────────────
 echo ""
@@ -144,10 +170,18 @@ MAST3R_END=$(date +%s)
 MAST3R_ELAPSED=$(( MAST3R_END - MAST3R_START ))
 MAST3R_MIN=$(awk "BEGIN {printf \"%.1f\", $MAST3R_ELAPSED / 60}")
 echo "    → MASt3R step: ${MAST3R_ELAPSED}s (${MAST3R_MIN} min)"
+
+emit_event "{\"event\":\"mast3r_done\",\"elapsed_s\":$MAST3R_ELAPSED}"
+
 if (( MAST3R_ELAPSED > 120 )); then
     echo "    ⚠  Slow MASt3R (>${MAST3R_ELAPSED}s) — compiling the RoPE2D CUDA kernel would save ~20-40% here. See InstantSplat/TODO.md."
 else
     echo "    ✓  MASt3R fast enough — RoPE2D CUDA kernel not worth optimizing yet."
+fi
+
+EARLY_STOP_ARGS=""
+if [[ "$EARLY_STOP" == "1" ]]; then
+    EARLY_STOP_ARGS="--early_stop_patience 200 --early_stop_delta 1e-5"
 fi
 
 CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
@@ -158,21 +192,38 @@ CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
     --iterations "$ITERS" \
     --pp_optimizer \
     --optim_pose \
+    $EARLY_STOP_ARGS \
     2>&1 | tee "$MODEL_DIR/02_train.log"
 
 echo "    → done"
 
+# ── Emit train_done event (grep tee'd log for early-stop info) ───────────────
+TRAIN_END=$(date +%s)
+TRAIN_ELAPSED=$(( TRAIN_END - MAST3R_END ))
+EARLY_STOPPED_FLAG="false"
+STOPPED_AT_ITER="null"
+if grep -q 'Early stopping' "$MODEL_DIR/02_train.log" 2>/dev/null; then
+    EARLY_STOPPED_FLAG="true"
+    STOPPED_AT_ITER=$(grep -oP '\[ITER \K\d+(?=\] Early stopping)' "$MODEL_DIR/02_train.log" | tail -1)
+    STOPPED_AT_ITER=${STOPPED_AT_ITER:-null}
+fi
+emit_event "{\"event\":\"train_done\",\"elapsed_s\":$TRAIN_ELAPSED,\"early_stopped\":$EARLY_STOPPED_FLAG,\"stopped_at_iter\":$STOPPED_AT_ITER}"
+
 # ── Step 3: PLY → .splat ─────────────────────────────────────────────────────
 echo ""
 echo "[3/3] Converting to .splat..."
+PLY2SPLAT_START=$(date +%s)
 "$PYTHON" "$REPO/ply2splat.py" "$PLY" "$SPLAT_OUT"
+PLY2SPLAT_ELAPSED=$(( $(date +%s) - PLY2SPLAT_START ))
+SPLAT_SIZE=$(stat -c%s "$SPLAT_OUT" 2>/dev/null || echo 0)
+emit_event "{\"event\":\"splat_ready\",\"filename\":\"$(basename $SPLAT_OUT)\",\"size_bytes\":$SPLAT_SIZE,\"ply2splat_s\":$PLY2SPLAT_ELAPSED}"
 
 # ── Save run metadata ─────────────────────────────────────────────────────────
 PIPELINE_END=$(date +%s)
 ELAPSED=$(( PIPELINE_END - PIPELINE_START ))
 ELAPSED_MIN=$(awk "BEGIN {printf \"%.1f\", $ELAPSED / 60}")
 
-PARAMS_FILE="$MODEL_DIR/${SCENE}_f${TOTAL_FRAMES}_i${ITERS}.params.json"
+PARAMS_FILE="$MODEL_DIR/${SCENE}_f${TOTAL_FRAMES}_i${ACTUAL_ITER}.params.json"
 cat > "$PARAMS_FILE" <<EOF
 {
   "scene":            "$SCENE",
@@ -182,7 +233,7 @@ cat > "$PARAMS_FILE" <<EOF
   "fps":              ${VFPS:-null},
   "n_frames_per_video": ${VN_FRAMES:-null},
   "total_frames":     $TOTAL_FRAMES,
-  "iters":            $ITERS,
+  "iters":            $ACTUAL_ITER,
   "splat":            "$SPLAT_OUT",
   "mast3r_seconds":   $MAST3R_ELAPSED,
   "render_seconds":   $ELAPSED,
