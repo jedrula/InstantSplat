@@ -139,13 +139,6 @@ done
 TOTAL_FRAMES=$(ls "$IMAGE_DIR"/frame_*.png 2>/dev/null | wc -l)
 echo "    → $TOTAL_FRAMES total frames (PNG) → $IMAGE_DIR"
 
-# Use the latest saved iteration (early stop may save before ITERS)
-ACTUAL_ITER=$(ls -d "$MODEL_DIR/point_cloud/iteration_"* 2>/dev/null \
-    | grep -oP 'iteration_\K\d+' | sort -n | tail -1)
-ACTUAL_ITER=${ACTUAL_ITER:-$ITERS}
-PLY="$MODEL_DIR/point_cloud/iteration_${ACTUAL_ITER}/point_cloud.ply"
-SPLAT_OUT="$MODEL_DIR/${SCENE}_f${TOTAL_FRAMES}_i${ACTUAL_ITER}.splat"
-
 PIPELINE_START=$(date +%s)
 
 emit_event "{\"event\":\"frames_extracted\",\"total_frames\":$TOTAL_FRAMES}"
@@ -208,6 +201,13 @@ if grep -q 'Early stopping' "$MODEL_DIR/02_train.log" 2>/dev/null; then
     STOPPED_AT_ITER=${STOPPED_AT_ITER:-null}
 fi
 emit_event "{\"event\":\"train_done\",\"elapsed_s\":$TRAIN_ELAPSED,\"early_stopped\":$EARLY_STOPPED_FLAG,\"stopped_at_iter\":$STOPPED_AT_ITER}"
+
+# Resolve actual iteration after training (early stop may save before ITERS)
+ACTUAL_ITER=$(ls -d "$MODEL_DIR/point_cloud/iteration_"* 2>/dev/null \
+    | grep -oP 'iteration_\K\d+' | sort -n | tail -1)
+ACTUAL_ITER=${ACTUAL_ITER:-$ITERS}
+PLY="$MODEL_DIR/point_cloud/iteration_${ACTUAL_ITER}/point_cloud.ply"
+SPLAT_OUT="$MODEL_DIR/${SCENE}_f${TOTAL_FRAMES}_i${ACTUAL_ITER}.splat"
 
 # ── Step 3: PLY → .splat ─────────────────────────────────────────────────────
 echo ""
