@@ -39,6 +39,8 @@ SCENE=""
 EARLY_STOP=1
 EVENTS_FILE=""
 MAX_INIT_POINTS=""
+SMART_FRAMES=0
+SMART_FPS=5.0
 VIDEOS=()
 
 while [[ $# -gt 0 ]]; do
@@ -53,6 +55,8 @@ while [[ $# -gt 0 ]]; do
         --early-stop)   EARLY_STOP=1;      shift ;;
         --no-early-stop) EARLY_STOP=0;     shift ;;
         --max-init-points) MAX_INIT_POINTS="$2"; shift 2 ;;
+        --smart-frames) SMART_FRAMES=1;    shift ;;
+        --smart-fps)    SMART_FPS="$2";    shift 2 ;;
         -*)             echo "Unknown option: $1"; exit 1 ;;
         *)              VIDEOS+=("$1"); shift ;;
     esac
@@ -84,8 +88,11 @@ USAGE="Usage:
 if [[ -n "$FPS_ARG" && -n "$N_FRAMES" ]]; then
     echo "Error: --fps and --n-frames are mutually exclusive"; exit 1
 fi
-if [[ -z "$FPS_ARG" && ( -z "$N_FRAMES" || -z "$DURATION" ) ]]; then
-    echo "Error: provide either --fps F or both --n-frames N and --duration S"
+if [[ -z "$FPS_ARG" && -z "$N_FRAMES" ]]; then
+    echo "Error: provide either --fps F or --n-frames N"; echo "$USAGE"; exit 1
+fi
+if [[ -z "$FPS_ARG" && -z "$DURATION" && "$SMART_FRAMES" == "0" ]]; then
+    echo "Error: --n-frames requires --duration (or add --smart-frames to auto-detect)"
     echo "$USAGE"; exit 1
 fi
 
@@ -109,30 +116,46 @@ mkdir -p "$IMAGE_DIR"
 
 FRAME_OFFSET=1
 for VIDEO in "${VIDEOS[@]}"; do
+    # Resolve duration and frame count for this video
+    VDURATION="$DURATION"
+    if [[ -z "$VDURATION" ]]; then
+        VDURATION=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$VIDEO" | awk '{printf "%.0f", $1}')
+    fi
     if [[ -n "$FPS_ARG" ]]; then
-        VDURATION="$DURATION"
-        if [[ -z "$VDURATION" ]]; then
-            VDURATION=$(ffprobe -v error -show_entries format=duration \
-                -of default=noprint_wrappers=1:nokey=1 "$VIDEO" | awk '{printf "%.0f", $1}')
-        fi
         VN_FRAMES=$(awk "BEGIN {printf \"%d\", int($FPS_ARG * $VDURATION + 0.5)}")
         VFPS=$FPS_ARG
     else
-        VDURATION="$DURATION"
         VN_FRAMES="$N_FRAMES"
         VFPS=$(awk "BEGIN {printf \"%.4f\", $VN_FRAMES / $VDURATION}")
     fi
 
-    echo "[1/3] $(basename "$VIDEO"): $VN_FRAMES frames over ${VDURATION}s at ${VFPS}fps (start=$START, offset=$FRAME_OFFSET)..."
-
-    ffmpeg -y -loglevel error \
-        -ss "$START" \
-        -t "$VDURATION" \
-        -i "$VIDEO" \
-        -vf "fps=$VFPS" \
-        -frames:v "$VN_FRAMES" \
-        -start_number "$FRAME_OFFSET" \
-        "$IMAGE_DIR/frame_%04d.png"
+    if [[ "$SMART_FRAMES" == "1" ]]; then
+        echo "[1/3] $(basename "$VIDEO"): smart-select $VN_FRAMES frames from ${VDURATION}s (oversample at ${SMART_FPS}fps, start=$START, offset=$FRAME_OFFSET)..."
+        TMP_SEL=$(mktemp -d)
+        "$PYTHON" "$REPO/select_frames.py" "$VIDEO" \
+            --fps "$SMART_FPS" \
+            --target "$VN_FRAMES" \
+            --start "$START" \
+            --duration "$VDURATION" \
+            --out "$TMP_SEL"
+        DEST_IDX=$FRAME_OFFSET
+        for f in $(ls "$TMP_SEL/selected/frame_"*.png 2>/dev/null | sort); do
+            cp "$f" "$IMAGE_DIR/$(printf 'frame_%04d.png' $DEST_IDX)"
+            DEST_IDX=$(( DEST_IDX + 1 ))
+        done
+        rm -rf "$TMP_SEL"
+    else
+        echo "[1/3] $(basename "$VIDEO"): $VN_FRAMES frames over ${VDURATION}s at ${VFPS}fps (start=$START, offset=$FRAME_OFFSET)..."
+        ffmpeg -y -loglevel error \
+            -ss "$START" \
+            -t "$VDURATION" \
+            -i "$VIDEO" \
+            -vf "fps=$VFPS" \
+            -frames:v "$VN_FRAMES" \
+            -start_number "$FRAME_OFFSET" \
+            "$IMAGE_DIR/frame_%04d.png"
+    fi
 
     EXTRACTED=$(ls "$IMAGE_DIR"/frame_*.png 2>/dev/null | wc -l)
     FRAME_OFFSET=$(( EXTRACTED + 1 ))

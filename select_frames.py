@@ -3,31 +3,35 @@
 select_frames.py — High-quality keyframe selection for 3DGS/SfM pipelines.
 
 Takes a video, oversamples it, then greedily selects the best subset for
-reconstruction — filtering blurry frames, avoiding duplicates, and ensuring
-good temporal coverage.
+reconstruction — ensuring evenly-spaced VISUAL OVERLAP between consecutive
+selected frames (not even time spacing).
+
+Algorithm:
+    1. Extract all frames at --fps (oversampling).
+    2. Compute blur score per frame (95th-pctile abs-Laplacian).
+    3. Compute dense Farneback optical flow between every consecutive frame
+       pair → build a cumulative displacement curve (total px moved vs frame).
+       Works on textureless walls, no features needed.
+    4. Compute target_step = total_displacement / target.
+    5. Greedy walk: from each anchor frame, find the frame where cumulative
+       displacement from anchor = target_step ("sweet spot frame").
+       - If that frame is blurry: scan backward (preferred, safer overlap)
+         then forward for the first non-blurry neighbor.
+       - Commit that frame as next anchor.
+    6. Always include first and last non-blurry frames.
+    7. Run ORB match count on the FINAL selected pairs only (for debug HTML).
 
 Usage:
     python select_frames.py video.mp4
-    python select_frames.py video.mp4 --fps 5 --target 60 --out ./out
-    python select_frames.py video.mp4 --fps 3 --target 20 --start 5 --duration 30
-    python select_frames.py video.mp4 --no-extract   # re-run selection on existing frames
+    python select_frames.py video.mp4 --fps 5 --target 12 --out ./out
+    python select_frames.py video.mp4 --no-extract   # re-run on existing frames
 
 Outputs:
     <out>/all/          all extracted frames (PNG)
-    <out>/selected/     the chosen keyframes (copied, ready for MASt3R / COLMAP)
-    <out>/thumbs/       thumbnails used by debug.html
+    <out>/selected/     the chosen keyframes (ready for MASt3R / COLMAP)
+    <out>/thumbs/       thumbnails for debug.html
     <out>/debug.html    visual debug page — open in browser
-    <out>/metadata.json full per-frame data (blur, score, status, …)
-
-TODO — upgrade path:
-    - Replace ORB with SuperPoint / MASt3R features for better matches on
-      textureless or repetitive surfaces (climbing walls, plain rock).
-    - Replace ratio-test match count with RANSAC inlier count (geometric
-      verification) to eliminate false matches from repetitive patterns.
-    - Add global coverage constraint: cluster frames by appearance and enforce
-      minimum selection from each cluster to avoid gaps across the whole scene.
-    - Add temporal smoothness: prefer selections that are evenly spaced in time,
-      not just by information gain.
+    <out>/metadata.json full per-frame data
 """
 
 import argparse
@@ -46,54 +50,76 @@ from tqdm import tqdm
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
-THUMB_W = 180          # px — thumbnail width in debug HTML grid
-TIMELINE_BAR_W = 3     # px — width of each frame bar in the timeline strip
+THUMB_W = 180
+TIMELINE_BAR_W = 3
 DEFAULT_FPS = 3.0
 DEFAULT_TARGET = 60
 DEFAULT_NEIGHBORS = 5
 DEFAULT_MIN_MATCHES = 40
 DEFAULT_MAX_MATCHES = 400
-DEFAULT_BLUR_PCTILE = 10.0   # hard-reject frames below this blur percentile
+DEFAULT_BLUR_PCTILE = 10.0
+FLOW_SCALE = 0.25   # downscale factor for optical flow (speed vs accuracy)
 
 
-# ── Feature extraction & matching ────────────────────────────────────────────
+# ── Blur scoring ──────────────────────────────────────────────────────────────
 
 def compute_blur(img: np.ndarray) -> float:
     """
     95th-percentile of absolute Laplacian values.
 
-    Why not variance: on a climbing wall most of the frame is plain beige
-    background — few edges, low variance — making sharp background frames
-    look blurry. Taking the high percentile instead finds the sharpest
-    edges anywhere in the frame (holds, chalk marks, wall features) and
-    ignores the empty regions. A truly blurry frame has no sharp edges
-    anywhere, so the 95th percentile stays low regardless of content.
+    Uses high percentile instead of variance because climbing walls are
+    mostly plain background — variance stays low even on sharp frames.
+    The 95th percentile finds the sharpest edges anywhere (holds, chalk)
+    and is unaffected by the plain background regions.
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return float(np.percentile(np.abs(cv2.Laplacian(gray, cv2.CV_64F)), 95))
 
 
-def extract_orb(img: np.ndarray, orb) -> tuple:
-    """
-    Extract ORB keypoints and descriptors.
+# ── Optical flow displacement ─────────────────────────────────────────────────
 
-    ORB is fast and runs on CPU — good baseline for a preprocessing step.
-    TODO: replace with SuperPoint (GPU) or MASt3R features for better quality
-    on repetitive textures (e.g. climbing wall beige background).
+def compute_consecutive_flow(images: list, scale: float = FLOW_SCALE) -> np.ndarray:
     """
+    Compute mean optical flow magnitude between every consecutive image pair.
+
+    Returns array of shape (N-1,) where result[i] = mean px displacement
+    (at original resolution) from frame i to frame i+1.
+
+    Uses dense Farneback flow at downscaled resolution for speed.
+    Works on textureless surfaces (climbing walls, plain rock) where
+    sparse feature detectors like ORB struggle.
+    """
+    N = len(images)
+    displacements = np.zeros(N - 1, dtype=np.float32)
+    inv_scale = 1.0 / scale
+
+    prev_gray = None
+    for i, img in enumerate(tqdm(images, leave=False)):
+        small = cv2.resize(img, None, fx=scale, fy=scale,
+                           interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            flow = cv2.calcOpticalFlowFarneback(
+                prev_gray, gray, None,
+                pyr_scale=0.5, levels=3, winsize=13,
+                iterations=3, poly_n=5, poly_sigma=1.1, flags=0,
+            )
+            # mean magnitude, scaled back to original-resolution pixels
+            mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2).mean()
+            displacements[i - 1] = mag * inv_scale
+        prev_gray = gray
+
+    return displacements
+
+
+# ── ORB matching (display only) ───────────────────────────────────────────────
+
+def extract_orb(img: np.ndarray, orb) -> tuple:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return orb.detectAndCompute(gray, None)
 
 
 def count_matches(des1, des2, bf) -> int:
-    """
-    Lowe's ratio test match count between two descriptor sets.
-    Returns a proxy for frame-to-frame similarity.
-
-    TODO: replace with RANSAC inlier count (essential matrix) to eliminate
-    false matches caused by repetitive patterns — more expensive but much
-    more reliable as a "do these frames actually overlap?" signal.
-    """
     if des1 is None or des2 is None or len(des1) < 2 or len(des2) < 2:
         return 0
     try:
@@ -118,29 +144,32 @@ def select_frames(
     min_gap: int = -1,
 ) -> tuple:
     """
-    Select `target` high-quality, evenly-distributed frames from `paths`.
+    Select `target` keyframes with evenly-distributed visual overlap.
 
     Returns:
         selected    list of selected indices (in temporal order)
         frame_data  list of per-frame dicts (for debug HTML / metadata.json)
 
     Algorithm:
-        1. Compute blur score (95th-pctile abs-Laplacian) for every frame.
-        2. Divide the timeline into `target` equal-width bins.
-        3. Within each bin, pick the sharpest non-blurry frame that is at
-           least `min_gap` frames from the previous selection.
-           If no candidate satisfies the gap, fall back to any frame in the bin.
-           If every frame in a bin is below the blur floor, pick the least blurry.
-        4. Build a local ORB similarity graph for the HTML visualisation
-           (shows overlap between consecutive selected frames — not a selection gate).
+        1. Compute blur score per frame.
+        2. Compute consecutive dense optical flow (Farneback, downscaled) → O(N).
+        3. Build cumulative displacement: cum[i] = total px moved from frame 0 to i.
+        4. target_step = total_displacement / target
+           (the camera displacement we want between every pair of keyframes).
+        5. Greedy walk from anchor:
+           - Find the "sweet spot" frame where cum[j] - cum[anchor] ≈ target_step.
+           - If that frame is blurry: scan backward (preferred — keeps more overlap)
+             then forward for the first non-blurry neighbor within a search window.
+           - Commit that frame as next anchor.
+        6. Always force-include first and last non-blurry frames.
+        7. ORB matching on final selected pairs only (for debug display).
 
-    min_gap=-1 means auto: half the bin size, minimum 2.
-
-    Why bins instead of greedy:
-        Greedy chases information gain and clusters selections around textured
-        regions (dense holds), leaving long plain sections unrepresented.
-        Equal bins guarantee one frame per time-slice of the clip regardless
-        of local texture density.
+    Why cumulative flow instead of per-anchor ORB matching:
+        - ORB is unreliable on textureless climbing walls (holds are few and
+          repetitive, causing false matches / missed matches).
+        - Optical flow works at pixel level — no features needed, no false matches.
+        - One precomputation pass covers all anchors. No binary search needed.
+        - Direct physical meaning: "camera moved X pixels" → easy to reason about.
     """
     N = len(paths)
 
@@ -155,70 +184,118 @@ def select_frames(
 
     # ── Blur scores ───────────────────────────────────────────────────────────
     print("  Computing blur scores…")
-    blur_raw = np.array([compute_blur(img) for img in tqdm(images, leave=False)])
+    blur_raw  = np.array([compute_blur(img) for img in tqdm(images, leave=False)])
     blur_norm = blur_raw / (blur_raw.max() + 1e-6)
     hard_blur_floor = np.percentile(blur_raw, blur_pctile_cutoff)
 
-    # ── Bin-based selection ───────────────────────────────────────────────────
-    # Divide [0, N) into `target` equal bins; pick sharpest frame in each.
-    bin_size = N / target
-    _gap = max(2, int(bin_size // 2)) if min_gap < 0 else min_gap
-    selected = []
-    last = -_gap  # tracks index of the most recently selected frame
-    for b in range(target):
-        lo = int(b * bin_size)
-        hi = min(int((b + 1) * bin_size), N)
-        if lo >= hi:
-            continue
-        # Prefer candidates that are at least _gap frames from last selection.
-        gapped = [i for i in range(lo, hi) if i - last >= _gap]
-        pool_all = gapped if gapped else list(range(lo, hi))
-        non_blurry = [i for i in pool_all if blur_raw[i] >= hard_blur_floor]
-        pool = non_blurry if non_blurry else pool_all
-        best = max(pool, key=lambda i: blur_raw[i])
-        selected.append(best)
-        last = best
+    # ── Consecutive optical flow ──────────────────────────────────────────────
+    print("  Computing optical flow (consecutive pairs)…")
+    step_flow = compute_consecutive_flow(images)   # shape (N-1,)
 
-    # ── ORB similarity graph (display only) ──────────────────────────────────
-    # Computed for consecutive selected-frame pairs so the HTML can show
-    # how much overlap neighbouring keyframes share.
-    print("  Extracting ORB features for overlap display…")
+    # Cumulative displacement from frame 0
+    # cum[i] = total px camera has moved from frame 0 up to frame i
+    cum = np.zeros(N, dtype=np.float64)
+    cum[1:] = np.cumsum(step_flow)
+
+    total_disp   = cum[-1]
+    target_step  = total_disp / max(target - 1, 1)
+
+    print(f"  Total displacement: {total_disp:.1f} px  |  "
+          f"target step: {target_step:.1f} px/keyframe")
+
+    # ── Greedy walk ───────────────────────────────────────────────────────────
+    non_blurry = [i for i in range(N) if blur_raw[i] >= hard_blur_floor]
+    if not non_blurry:
+        non_blurry = list(range(N))
+
+    def best_near(ideal_idx: int) -> int:
+        """
+        Return the sharpest non-blurry frame close to ideal_idx.
+        Search window: ±search_r frames, bias backward (safer: more overlap).
+        If nothing found in window, return the ideal frame regardless of blur.
+        """
+        search_r = max(3, int(N / (target * 2)))
+        # Backward pass first (keeps overlap on the safe side)
+        for d in range(0, search_r + 1):
+            for delta in ([-d] if d == 0 else [-d, d]):
+                j = ideal_idx + delta
+                if 0 <= j < N and blur_raw[j] >= hard_blur_floor:
+                    return j
+        return ideal_idx  # fallback: accept blurry frame
+
+    anchor = non_blurry[0]
+    selected = [anchor]
+
+    while True:
+        disp_needed = cum[anchor] + target_step
+        if disp_needed >= cum[-1]:
+            break
+        # Frame whose cumulative displacement is closest to disp_needed
+        ideal = int(np.searchsorted(cum, disp_needed, side='left'))
+        ideal = min(ideal, N - 1)
+        # Don't go backward past anchor + 1
+        ideal = max(ideal, anchor + 1)
+        chosen = best_near(ideal)
+        if chosen <= anchor:
+            chosen = anchor + 1  # safety: always advance
+        selected.append(chosen)
+        anchor = chosen
+        if anchor >= N - 1:
+            break
+
+    # Always include last non-blurry frame
+    last_good = non_blurry[-1]
+    if last_good not in set(selected) and last_good > selected[-1]:
+        selected.append(last_good)
+
+    selected = sorted(set(selected))
+
+    # ── ORB overlap for debug display (final pairs only) ─────────────────────
+    print("  Computing ORB overlap for selected pairs (display only)…")
     orb = cv2.ORB_create(5000)
     bf  = cv2.BFMatcher(cv2.NORM_HAMMING)
-    features = [extract_orb(images[i], orb) for i in tqdm(selected, leave=False)]
-    sel_overlap = {}  # sel_overlap[i] = matches between selected[i] and selected[i-1]
+    sel_features = [extract_orb(images[i], orb) for i in tqdm(selected, leave=False)]
+    sel_overlap  = {}
     for k in range(1, len(selected)):
-        m = count_matches(features[k - 1][1], features[k][1], bf)
+        m = count_matches(sel_features[k - 1][1], sel_features[k][1], bf)
         sel_overlap[selected[k]] = m
 
-    # ── Build per-frame metadata ──────────────────────────────────────────────
+    # ── Per-frame metadata ────────────────────────────────────────────────────
     selected_set = set(selected)
     sel_order    = {idx: order for order, idx in enumerate(selected)}
-    frame_data   = []
+    gap_frames   = {idx for idx, m in sel_overlap.items() if m < min_matches}
+
+    frame_data = []
     for i in range(N):
-        b = int(i / bin_size)
         if i in selected_set:
-            status = 'selected'
+            status = 'no_overlap' if i in gap_frames else 'selected'
         elif blur_raw[i] < hard_blur_floor:
             status = 'blurry'
         else:
             status = 'skipped'
+
+        # Flow delta: how much the camera moved from the previous frame
+        flow_delta = float(step_flow[i - 1]) if i > 0 else 0.0
 
         frame_data.append({
             'idx':             i,
             'path':            paths[i],
             'blur_raw':        float(blur_raw[i]),
             'blur_norm':       float(blur_norm[i]),
-            'score':           float(blur_norm[i]),   # score == sharpness in bin model
+            'score':           float(blur_norm[i]),
             'conn':            0.0,
             'redundancy':      0.0,
             'status':          status,
             'selection_order': sel_order.get(i),
-            'bin':             b,
-            'overlap_prev':    sel_overlap.get(i),    # None for non-selected or first
+            'bin':             0,
+            'overlap_prev':    sel_overlap.get(i),
+            'cum_disp':        float(cum[i]),
+            'flow_delta':      flow_delta,
+            'target_step':     float(target_step),
         })
 
     return selected, frame_data
+
 
 
 # ── Thumbnails ────────────────────────────────────────────────────────────────
@@ -282,6 +359,8 @@ def generate_html(frame_data: list, selected: list, out_dir: Path, args) -> str:
         order = (f'<span class="order">#{f["selection_order"]+1}</span>'
                  if f['selection_order'] is not None else '')
         blur_pct = int(f['blur_norm'] * 100)
+        ovl = f'· orb {f["overlap_prev"]}' if f.get('overlap_prev') is not None else ''
+        flow_str = f'· flow {f["flow_delta"]:.1f}px' if f.get('flow_delta') else ''
         cards.append(f'''
 <div class="card {f["status"]}" id="f{f['idx']:04d}" data-status="{f['status']}"
      data-full="{full_rel}" data-idx="{f['idx']}"
@@ -290,14 +369,13 @@ def generate_html(frame_data: list, selected: list, out_dir: Path, args) -> str:
   <div class="meta">
     <div class="row"><span class="idx">frame {f['idx']:04d}</span>{order}</div>
     <div class="row"><span class="badge" style="background:{color}">{label}</span></div>
-    <div class="row dim">blur {blur_pct}% · score {f["score"]:.2f}</div>
+    <div class="row dim">blur {blur_pct}% · score {f["score"]:.2f} {flow_str} {ovl}</div>
   </div>
 </div>''')
 
     cards_html = '\n'.join(cards)
-    params = (f"fps={args.fps} · target={args.target} · neighbors={args.neighbors} · "
-              f"min_matches={args.min_matches} · max_matches={args.max_matches} · "
-              f"blur_pctile={args.blur_pctile}")
+    params = (f"fps={args.fps} · target={args.target} · method=optical-flow · "
+              f"min_matches={args.min_matches} · blur_pctile={args.blur_pctile}")
 
     # JSON blobs embedded in the page for the lightbox JS
     import json as _json
