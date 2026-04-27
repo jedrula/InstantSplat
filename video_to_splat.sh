@@ -38,6 +38,7 @@ START=0
 SCENE=""
 EARLY_STOP=1
 EVENTS_FILE=""
+MAX_INIT_POINTS=""
 VIDEOS=()
 
 while [[ $# -gt 0 ]]; do
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --events-file)  EVENTS_FILE="$2";  shift 2 ;;
         --early-stop)   EARLY_STOP=1;      shift ;;
         --no-early-stop) EARLY_STOP=0;     shift ;;
+        --max-init-points) MAX_INIT_POINTS="$2"; shift 2 ;;
         -*)             echo "Unknown option: $1"; exit 1 ;;
         *)              VIDEOS+=("$1"); shift ;;
     esac
@@ -150,6 +152,8 @@ mkdir -p "$MODEL_DIR"
 cd "$REPO"
 
 MAST3R_START=$(date +%s)
+INIT_GEO_ARGS=""
+[[ -n "$MAX_INIT_POINTS" ]] && INIT_GEO_ARGS="--max_init_points $MAX_INIT_POINTS"
 CUDA_VISIBLE_DEVICES=0 "$PYTHON" -W ignore ./init_geo.py \
     -s "$SCENE_DIR" \
     -m "$MODEL_DIR" \
@@ -158,6 +162,7 @@ CUDA_VISIBLE_DEVICES=0 "$PYTHON" -W ignore ./init_geo.py \
     --co_vis_dsp \
     --conf_aware_ranking \
     --infer_video \
+    $INIT_GEO_ARGS \
     2>&1 | tee "$MODEL_DIR/01_init_geo.log"
 MAST3R_END=$(date +%s)
 MAST3R_ELAPSED=$(( MAST3R_END - MAST3R_START ))

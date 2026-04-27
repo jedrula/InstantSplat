@@ -1,5 +1,11 @@
 # InstantSplat TODOs
 
+## Pipeline choice
+
+See [PIPELINE_COMPARISON.md](PIPELINE_COMPARISON.md) for a full write-up of why
+InstantSplat outperforms the GLOMAP+gsplat approach for our climbing-wall use case,
+and guidance on how to improve quality further.
+
 ## Performance
 - [ ] Compile RoPE2D CUDA kernel to speed up MASt3R inference (~20-40% faster on that step).
       Currently falls back to slow PyTorch version: "cannot find cuda-compiled version of RoPE2D".

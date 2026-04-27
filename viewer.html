@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Splat Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; overflow: hidden; font-family: monospace; }
+  #info {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    color: #aaa; font-size: 12px; pointer-events: none; z-index: 10;
+  }
+  #error {
+    display: none; position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: #f88; font-size: 14px; text-align: center;
+  }
+</style>
+</head>
+<body>
+<div id="info">drag to orbit · scroll to zoom · right-drag to pan</div>
+<div id="error"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as GaussianSplats3D from
+  'https://unpkg.com/@mkkellogg/gaussian-splats-3d@0.4.1/build/gaussian-splats-3d.module.js';
+
+const params = new URLSearchParams(window.location.search);
+const splat  = params.get('splat');
+
+if (!splat) {
+  document.getElementById('error').style.display = 'block';
+  document.getElementById('error').textContent =
+    'No splat specified.\nAdd ?splat=filename.splat to the URL.';
+} else {
+  document.title = splat + ' — Splat Viewer';
+  const viewer = new GaussianSplats3D.Viewer({
+    cameraUp: [0, -1, 0],
+    initialCameraPosition: [0, 0, -3],
+    initialCameraLookAt: [0, 0, 0],
+  });
+  viewer.addSplatScene(splat)
+    .then(() => viewer.start())
+    .catch(e => {
+      document.getElementById('error').style.display = 'block';
+      document.getElementById('error').textContent = 'Failed to load: ' + e.message;
+    });
+}
+</script>
+</body>
+</html>

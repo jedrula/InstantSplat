@@ -10,5 +10,7 @@ build
 diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
 
-# MASt3R intermediate outputs (regeneratable, large)
-assets/examples/*/sparse_*
+# Scene data and outputs (large, regeneratable)
+assets/examples/
+output_infer/
+output_glomap/

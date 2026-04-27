@@ -11,7 +11,8 @@ ic(torch.cuda.is_available())  # Check if CUDA is available
 ic(torch.cuda.device_count())
 
 from mast3r.model import AsymmetricMASt3R
-from dust3r.image_pairs import make_pairs
+from mast3r.image_pairs import make_pairs
+from mast3r.retrieval.graph import make_pairs_fps
 from dust3r.inference import inference
 from dust3r.utils.device import to_numpy
 from dust3r.utils.geometry import inv
@@ -21,8 +22,23 @@ from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D, sav
 from utils.camera_utils import generate_interpolated_path
 
 
-def main(source_path, model_path, ckpt_path, device, batch_size, image_size, schedule, lr, niter, 
-         min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False, focal_avg=False, infer_video=False):
+RETRIEVAL_THRESHOLD = 15  # use sparse pairs above this image count
+
+@torch.no_grad()
+def _compute_sim_matrix(model, images, device):
+    """Global cosine-similarity matrix via mean-pooled encoder features."""
+    descs = []
+    for img_data in images:
+        feat = model._encode_image(img_data['img'].to(device),
+                                   true_shape=img_data['true_shape'])[0]  # (1, P, D)
+        desc = torch.nn.functional.normalize(feat.mean(dim=1), dim=-1)   # (1, D)
+        descs.append(desc.cpu())
+    descs = torch.cat(descs, dim=0)  # (N, D)
+    return (descs @ descs.T).numpy()
+
+
+def main(source_path, model_path, ckpt_path, device, batch_size, image_size, schedule, lr, niter,
+         min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False, focal_avg=False, infer_video=False, max_init_points=None):
 
     # ---------------- (1) Load model and images ----------------  
     save_path, sparse_0_path, sparse_1_path = init_filestructure(Path(source_path), n_views)
@@ -40,7 +56,15 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
 
     start_time = time()
     print(f'>> Making pairs...')
-    pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
+    if len(images) > RETRIEVAL_THRESHOLD:
+        sim_mat = _compute_sim_matrix(model, images, device)
+        Na = max(5, len(images) // 3)
+        fps_pairs, _ = make_pairs_fps(sim_mat, Na=Na, tokK=2)
+        pairs = [(images[i], images[j]) for i, j in fps_pairs]
+        pairs += [(images[j], images[i]) for i, j in fps_pairs]  # symmetrize
+        print(f'>> Sparse pairs: {len(fps_pairs)} unique ({len(images)} images, Na={Na})')
+    else:
+        pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
     print(f'>> Inference...')
     output = inference(pairs, model, device, batch_size=1, verbose=True)
     del model
@@ -124,7 +148,10 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
     save_time(model_path, '[1] init_geo', end_time - start_time)
     save_extrinsic(sparse_0_path, extrinsics_w2c, image_files, image_suffix)
     save_intrinsics(sparse_0_path, focals, org_imgs_shape, imgs.shape, save_focals=True)
-    pts_num = save_points3D(sparse_0_path, imgs, pts3d, confs.reshape(pts3d.shape[0], -1), overlapping_masks, use_masks=co_vis_dsp, save_all_pts=True, save_txt_path=model_path, depth_threshold=depth_thre)
+    save_pts_kwargs = dict(use_masks=co_vis_dsp, save_all_pts=True, save_txt_path=model_path, depth_threshold=depth_thre)
+    if max_init_points is not None:
+        save_pts_kwargs['max_pts_num'] = max_init_points
+    pts_num = save_points3D(sparse_0_path, imgs, pts3d, confs.reshape(pts3d.shape[0], -1), overlapping_masks, **save_pts_kwargs)
     save_images_and_masks(sparse_0_path, n_views, imgs, overlapping_masks, image_files, image_suffix)
     print(f'[INFO] MASt3R Reconstruction is successfully converted to COLMAP files in: {str(sparse_0_path)}')
     print(f'[INFO] Number of points: {pts3d.reshape(-1, 3).shape[0]}')    
@@ -151,7 +178,10 @@ if __name__ == "__main__":
     parser.add_argument('--co_vis_dsp', action="store_true")
     parser.add_argument('--depth_thre', type=float, default=0.01, help='Depth threshold')
     parser.add_argument('--infer_video', action="store_true")
+    parser.add_argument('--max_init_points', type=int, default=None,
+                        help='Cap initial point cloud size (confidence-weighted downsample)')
 
     args = parser.parse_args()
-    main(args.source_path, args.model_path, args.ckpt_path, args.device, args.batch_size, args.image_size, args.schedule, args.lr, args.niter,         
-          args.min_conf_thr, args.llffhold, args.n_views, args.co_vis_dsp, args.depth_thre, args.conf_aware_ranking, args.focal_avg, args.infer_video)
+    main(args.source_path, args.model_path, args.ckpt_path, args.device, args.batch_size, args.image_size, args.schedule, args.lr, args.niter,
+          args.min_conf_thr, args.llffhold, args.n_views, args.co_vis_dsp, args.depth_thre, args.conf_aware_ranking, args.focal_avg, args.infer_video,
+          args.max_init_points)
