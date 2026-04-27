@@ -202,7 +202,11 @@ fi
 
 EARLY_STOP_ARGS=""
 if [[ "$EARLY_STOP" == "1" ]]; then
-    EARLY_STOP_ARGS="--early_stop_patience 200 --early_stop_delta 1e-5"
+    # Smart-frames scenes cover more of the wall — far cameras need more iters
+    # to converge, so double the patience to avoid stopping too early.
+    PATIENCE=200
+    [[ "$SMART_FRAMES" == "1" ]] && PATIENCE=400
+    EARLY_STOP_ARGS="--early_stop_patience $PATIENCE --early_stop_delta 1e-5"
 fi
 
 CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
