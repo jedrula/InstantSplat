@@ -22,7 +22,6 @@ from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D, sav
 from utils.camera_utils import generate_interpolated_path
 
 
-RETRIEVAL_THRESHOLD = 15  # use sparse pairs above this image count
 
 @torch.no_grad()
 def _compute_sim_matrix(model, images, device):
@@ -38,7 +37,7 @@ def _compute_sim_matrix(model, images, device):
 
 
 def main(source_path, model_path, ckpt_path, device, batch_size, image_size, schedule, lr, niter,
-         min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False, focal_avg=False, infer_video=False, max_init_points=None):
+         min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False, focal_avg=False, infer_video=False, max_init_points=None, sparse_pairs=False):
 
     # ---------------- (1) Load model and images ----------------  
     save_path, sparse_0_path, sparse_1_path = init_filestructure(Path(source_path), n_views)
@@ -56,15 +55,16 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
 
     start_time = time()
     print(f'>> Making pairs...')
-    if len(images) > RETRIEVAL_THRESHOLD:
+    if sparse_pairs:
         sim_mat = _compute_sim_matrix(model, images, device)
-        Na = max(5, len(images) // 3)
-        fps_pairs, _ = make_pairs_fps(sim_mat, Na=Na, tokK=2)
+        Na = max(8, len(images) // 2)
+        fps_pairs, _ = make_pairs_fps(sim_mat, Na=Na, tokK=4)
         pairs = [(images[i], images[j]) for i, j in fps_pairs]
         pairs += [(images[j], images[i]) for i, j in fps_pairs]  # symmetrize
         print(f'>> Sparse pairs: {len(fps_pairs)} unique ({len(images)} images, Na={Na})')
     else:
         pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
+        print(f'>> Complete graph: {len(pairs)//2} unique pairs ({len(images)} images)')
     print(f'>> Inference...')
     output = inference(pairs, model, device, batch_size=1, verbose=True)
     del model
@@ -180,8 +180,10 @@ if __name__ == "__main__":
     parser.add_argument('--infer_video', action="store_true")
     parser.add_argument('--max_init_points', type=int, default=None,
                         help='Cap initial point cloud size (confidence-weighted downsample)')
+    parser.add_argument('--sparse_pairs', action='store_true',
+                        help='Use sparse FPS retrieval pairing instead of complete graph (saves GPU memory for large frame counts)')
 
     args = parser.parse_args()
     main(args.source_path, args.model_path, args.ckpt_path, args.device, args.batch_size, args.image_size, args.schedule, args.lr, args.niter,
           args.min_conf_thr, args.llffhold, args.n_views, args.co_vis_dsp, args.depth_thre, args.conf_aware_ranking, args.focal_avg, args.infer_video,
-          args.max_init_points)
+          args.max_init_points, args.sparse_pairs)

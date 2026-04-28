@@ -30,26 +30,24 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="${INSTANTSPLAT_PYTHON:-${HOME}/miniconda3/envs/instantsplat/bin/python}"
 
 # ── Arg parsing ──────────────────────────────────────────────────────────────
-N_FRAMES=""
-DURATION=""
-FPS_ARG=""
 ITERS=""
-START=0
 SCENE=""
 EARLY_STOP=1
 EVENTS_FILE=""
 MAX_INIT_POINTS=""
 SMART_FRAMES=0
 SMART_FPS=5.0
+SPARSE_PAIRS=0
+# Per-video lists (comma-separated, one entry per video)
+FPS_LIST=""
+NFRAMES_LIST=""
+START_LIST=""
+DURATION_LIST=""
 VIDEOS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --scene)        SCENE="$2";        shift 2 ;;
-        --n-frames)     N_FRAMES="$2";     shift 2 ;;
-        --duration)     DURATION="$2";     shift 2 ;;
-        --fps)          FPS_ARG="$2";      shift 2 ;;
-        --start)        START="$2";        shift 2 ;;
         --iters)        ITERS="$2";        shift 2 ;;
         --events-file)  EVENTS_FILE="$2";  shift 2 ;;
         --early-stop)   EARLY_STOP=1;      shift ;;
@@ -57,6 +55,11 @@ while [[ $# -gt 0 ]]; do
         --max-init-points) MAX_INIT_POINTS="$2"; shift 2 ;;
         --smart-frames) SMART_FRAMES=1;    shift ;;
         --smart-fps)    SMART_FPS="$2";    shift 2 ;;
+        --sparse-pairs) SPARSE_PAIRS=1;    shift ;;
+        --fps-list)     FPS_LIST="$2";     shift 2 ;;
+        --nframes-list) NFRAMES_LIST="$2"; shift 2 ;;
+        --start-list)   START_LIST="$2";   shift 2 ;;
+        --duration-list) DURATION_LIST="$2"; shift 2 ;;
         -*)             echo "Unknown option: $1"; exit 1 ;;
         *)              VIDEOS+=("$1"); shift ;;
     esac
@@ -78,23 +81,25 @@ emit_event() {
 
 USAGE="Usage:
   bash video_to_splat.sh <video> [video2 ...] --scene NAME --iters N
-    mode A: --n-frames N --duration S
-    mode B: --fps F [--duration S]"
+    --fps-list F1,F2,...   OR  --nframes-list N1,N2,...
+    --start-list S1,S2,...  --duration-list D1,D2,..."
 
 [[ ${#VIDEOS[@]} -eq 0 ]] && { echo "$USAGE"; exit 1; }
 [[ -z "$SCENE" ]]          && { echo "Error: --scene is required"; echo "$USAGE"; exit 1; }
 [[ -z "$ITERS" ]]          && { echo "Error: --iters is required"; echo "$USAGE"; exit 1; }
 
-if [[ -n "$FPS_ARG" && -n "$N_FRAMES" ]]; then
-    echo "Error: --fps and --n-frames are mutually exclusive"; exit 1
+if [[ -n "$FPS_LIST" && -n "$NFRAMES_LIST" ]]; then
+    echo "Error: --fps-list and --nframes-list are mutually exclusive"; exit 1
 fi
-if [[ -z "$FPS_ARG" && -z "$N_FRAMES" ]]; then
-    echo "Error: provide either --fps F or --n-frames N"; echo "$USAGE"; exit 1
+if [[ -z "$FPS_LIST" && -z "$NFRAMES_LIST" ]]; then
+    echo "Error: provide either --fps-list or --nframes-list"; echo "$USAGE"; exit 1
 fi
-if [[ -z "$FPS_ARG" && -z "$DURATION" && "$SMART_FRAMES" == "0" ]]; then
-    echo "Error: --n-frames requires --duration (or add --smart-frames to auto-detect)"
-    echo "$USAGE"; exit 1
-fi
+
+# Split comma-separated lists into arrays
+IFS=',' read -ra _FPS_ARR      <<< "${FPS_LIST:-}"
+IFS=',' read -ra _NFRAMES_ARR  <<< "${NFRAMES_LIST:-}"
+IFS=',' read -ra _START_ARR    <<< "${START_LIST:-}"
+IFS=',' read -ra _DURATION_ARR <<< "${DURATION_LIST:-}"
 
 for VIDEO in "${VIDEOS[@]}"; do
     [[ ! -f "$VIDEO" ]] && { echo "Error: video not found: $VIDEO"; exit 1; }
@@ -115,28 +120,36 @@ rm -rf "$IMAGE_DIR"
 mkdir -p "$IMAGE_DIR"
 
 FRAME_OFFSET=1
+VIDEO_IDX=0
 for VIDEO in "${VIDEOS[@]}"; do
-    # Resolve duration and frame count for this video
-    VDURATION="$DURATION"
+    # Per-video start time (default 0)
+    VSTART="${_START_ARR[$VIDEO_IDX]:-0}"
+    [[ -z "$VSTART" ]] && VSTART=0
+
+    # Per-video duration: use provided value, else probe full video minus start
+    VDURATION="${_DURATION_ARR[$VIDEO_IDX]:-}"
     if [[ -z "$VDURATION" ]]; then
-        VDURATION=$(ffprobe -v error -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 "$VIDEO" | awk '{printf "%.0f", $1}')
+        FULL_DUR=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$VIDEO" | awk '{printf "%.3f", $1}')
+        VDURATION=$(awk "BEGIN {printf \"%.3f\", $FULL_DUR - $VSTART}")
     fi
-    if [[ -n "$FPS_ARG" ]]; then
-        VN_FRAMES=$(awk "BEGIN {printf \"%d\", int($FPS_ARG * $VDURATION + 0.5)}")
-        VFPS=$FPS_ARG
+
+    # Per-video fps / n-frames
+    if [[ -n "$FPS_LIST" ]]; then
+        VFPS="${_FPS_ARR[$VIDEO_IDX]:-0.5}"
+        VN_FRAMES=$(awk "BEGIN {printf \"%d\", int($VFPS * $VDURATION + 0.5)}")
     else
-        VN_FRAMES="$N_FRAMES"
+        VN_FRAMES="${_NFRAMES_ARR[$VIDEO_IDX]:-3}"
         VFPS=$(awk "BEGIN {printf \"%.4f\", $VN_FRAMES / $VDURATION}")
     fi
 
     if [[ "$SMART_FRAMES" == "1" ]]; then
-        echo "[1/3] $(basename "$VIDEO"): smart-select $VN_FRAMES frames from ${VDURATION}s (oversample at ${SMART_FPS}fps, start=$START, offset=$FRAME_OFFSET)..."
+        echo "[1/3] $(basename "$VIDEO"): smart-select $VN_FRAMES frames from ${VDURATION}s @ start=${VSTART}s (oversample ${SMART_FPS}fps, offset=$FRAME_OFFSET)..."
         TMP_SEL=$(mktemp -d)
         "$PYTHON" "$REPO/select_frames.py" "$VIDEO" \
             --fps "$SMART_FPS" \
             --target "$VN_FRAMES" \
-            --start "$START" \
+            --start "$VSTART" \
             --duration "$VDURATION" \
             --out "$TMP_SEL"
         DEST_IDX=$FRAME_OFFSET
@@ -146,9 +159,9 @@ for VIDEO in "${VIDEOS[@]}"; do
         done
         rm -rf "$TMP_SEL"
     else
-        echo "[1/3] $(basename "$VIDEO"): $VN_FRAMES frames over ${VDURATION}s at ${VFPS}fps (start=$START, offset=$FRAME_OFFSET)..."
+        echo "[1/3] $(basename "$VIDEO"): $VN_FRAMES frames over ${VDURATION}s at ${VFPS}fps (start=${VSTART}s, offset=$FRAME_OFFSET)..."
         ffmpeg -y -loglevel error \
-            -ss "$START" \
+            -ss "$VSTART" \
             -t "$VDURATION" \
             -i "$VIDEO" \
             -vf "fps=$VFPS" \
@@ -159,6 +172,7 @@ for VIDEO in "${VIDEOS[@]}"; do
 
     EXTRACTED=$(ls "$IMAGE_DIR"/frame_*.png 2>/dev/null | wc -l)
     FRAME_OFFSET=$(( EXTRACTED + 1 ))
+    VIDEO_IDX=$(( VIDEO_IDX + 1 ))
 done
 
 TOTAL_FRAMES=$(ls "$IMAGE_DIR"/frame_*.png 2>/dev/null | wc -l)
@@ -177,6 +191,7 @@ cd "$REPO"
 MAST3R_START=$(date +%s)
 INIT_GEO_ARGS=""
 [[ -n "$MAX_INIT_POINTS" ]] && INIT_GEO_ARGS="--max_init_points $MAX_INIT_POINTS"
+[[ "$SPARSE_PAIRS" == "1" ]] && INIT_GEO_ARGS="$INIT_GEO_ARGS --sparse_pairs"
 CUDA_VISIBLE_DEVICES=0 "$PYTHON" -W ignore ./init_geo.py \
     -s "$SCENE_DIR" \
     -m "$MODEL_DIR" \
@@ -260,10 +275,10 @@ cat > "$PARAMS_FILE" <<EOF
 {
   "scene":            "$SCENE",
   "videos":           [$(printf '"%s",' "${VIDEOS[@]}" | sed 's/,$//')]  ,
-  "start":            "$START",
-  "duration":         ${VDURATION:-null},
-  "fps":              ${VFPS:-null},
-  "n_frames_per_video": ${VN_FRAMES:-null},
+  "start_list":       "$START_LIST",
+  "duration_list":    "$DURATION_LIST",
+  "fps_list":         "$FPS_LIST",
+  "nframes_list":     "$NFRAMES_LIST",
   "total_frames":     $TOTAL_FRAMES,
   "iters":            $ACTUAL_ITER,
   "splat":            "$SPLAT_OUT",
