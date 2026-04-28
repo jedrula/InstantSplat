@@ -24,9 +24,11 @@ from utils.camera_utils import generate_interpolated_path
 
 
 # Auto-switch to SparseGA above this frame count to avoid GPU OOM.
-# Raised to 100: image_size=256 lets PointCloudOptimizer handle 40+ frames without OOM.
-# (Was 12 when image_size=512; SparseGA gave noticeably worse quality so we avoid it.)
-SPARSE_GA_THRESHOLD = 100
+# PCO stores ALL pair inference outputs in memory simultaneously: O(N² × H × W).
+# At image_size=512: safe up to ~12 frames. At image_size=256: safe up to ~20 frames.
+# Above threshold, SparseGA caches pairs to disk (O(1) GPU memory during inference).
+# Note: SparseGA reshape bug was fixed — results should now be usable above threshold.
+SPARSE_GA_THRESHOLD = 20
 
 
 @torch.no_grad()

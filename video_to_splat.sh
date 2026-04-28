@@ -22,7 +22,7 @@
 #   bash video_to_splat.sh v.mp4 --scene wall --n-frames 3 --duration 6 --iters 1000
 #   bash video_to_splat.sh v1.mp4 v2.mp4 --scene wall --n-frames 3 --duration 6 --iters 1000
 
-set -e
+set -eo pipefail
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 REPO="$(cd "$(dirname "$0")" && pwd)"
