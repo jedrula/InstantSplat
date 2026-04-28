@@ -27,14 +27,24 @@ there's nothing to segment, no unseen "back face" to inpaint, and the diffusion 
 generalise to a flat textured plane. Not worth pursuing.
 
 ### InstantSplat++ (phai-lab/InstantSplatPP)
-**Verdict: not a new algorithm — but 2D-GS mode is worth a future experiment.**
-InstantSplat++ is an extension of the exact same MASt3R → 3DGS pipeline we already run.
-The main additions are: support for **2D Gaussian Splatting** and Mip-Splatting as drop-in
-replacements for the standard 3D-GS trainer, plus optional VGGT/MapAnything priors.
+**Verdict: misleading marketing — the repo does not actually implement 2DGS.**
+Inspected the actual code: both `gaussian_renderer/__init__.py` and `__init__3dgs.py` import
+`diff_gaussian_rasterization` (standard 3DGS kernel). There is no `diff-surfel-rasterization`
+submodule, which is the CUDA kernel that real 2D Gaussian Splatting requires. The README claim
+of "2DGS and Mip-Splatting support" is not backed by the code. Not worth migrating to.
 
+## Future quality experiments
+
+### Real 2D Gaussian Splatting (hbb1/2d-gaussian-splatting)
 2D-GS (Huang et al., SIGGRAPH 2024) uses flat disc-shaped Gaussians instead of 3D ellipsoids.
-For near-planar scenes like a climbing wall, 2D-GS captures the flat surface geometry more
-accurately and produces fewer floaters perpendicular to the wall. This *could* directly improve
-our results. Swapping in the 2D-GS trainer from InstantSplat++ is a contained change (replace
-train.py + gaussian_renderer) with meaningful upside for our planar use case.
-- [ ] Try 2D-GS trainer from InstantSplat++ as a drop-in for train.py on a fpinka scene.
+For near-planar scenes like a climbing wall, discs align with the wall surface naturally and
+produce fewer floaters perpendicular to it. This is the correct implementation to try.
+
+Integration plan (init_geo.py is unchanged — poses are backend-agnostic):
+- Add `submodules/diff-surfel-rasterization` (the 2DGS CUDA kernel)
+- Pull `train_2dgs.py` + `scene/gaussian_model_2dgs.py` from hbb1/2d-gaussian-splatting
+- Add `--gs-type 3dgs|2dgs` flag to `video_to_splat.sh` to pick the trainer
+- Expose engine choice in Vue UI alongside image size
+- Risk: two CUDA submodules may conflict; may need a separate conda env
+
+- [ ] Try real 2DGS from hbb1/2d-gaussian-splatting on a fpinka scene.
