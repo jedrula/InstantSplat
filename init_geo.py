@@ -23,12 +23,6 @@ from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D, sav
 from utils.camera_utils import generate_interpolated_path
 
 
-# Auto-switch to SparseGA above this frame count to avoid GPU OOM.
-# PCO stores ALL pair inference outputs in memory simultaneously: O(N² × H × W).
-# At image_size=512: safe up to ~12 frames. At image_size=256: safe up to ~20 frames.
-# Above threshold, SparseGA caches pairs to disk (O(1) GPU memory during inference).
-# Note: SparseGA reshape bug was fixed — results should now be usable above threshold.
-SPARSE_GA_THRESHOLD = 20
 
 
 @torch.no_grad()
@@ -47,7 +41,7 @@ def _compute_sim_matrix(model, images, device):
 def main(source_path, model_path, ckpt_path, device, batch_size, image_size, schedule, lr, niter,
          min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False,
          focal_avg=False, infer_video=False, max_init_points=None, sparse_pairs=False,
-         use_sparse_ga=False, force_dense_ga=False):
+         use_sparse_ga=False):
 
     # ---------------- (1) Load model and images ----------------
     save_path, sparse_0_path, sparse_1_path = init_filestructure(Path(source_path), n_views)
@@ -63,8 +57,8 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
     images, org_imgs_shape = load_images(image_files, size=image_size)
 
     # Decide which aligner to use
-    do_sparse_ga = (use_sparse_ga or len(images) > SPARSE_GA_THRESHOLD) and not force_dense_ga
-    print(f'>> Aligner: {"SparseGA" if do_sparse_ga else "PointCloudOptimizer"} ({len(images)} frames, threshold={SPARSE_GA_THRESHOLD})')
+    do_sparse_ga = use_sparse_ga
+    print(f'>> Aligner: {"SparseGA" if do_sparse_ga else "PointCloudOptimizer"} ({len(images)} frames)')
 
     # Auto-cap init points for SparseGA to avoid 3DGS training OOM
     if do_sparse_ga and max_init_points is None:
@@ -239,13 +233,11 @@ if __name__ == "__main__":
     parser.add_argument('--sparse_pairs', action='store_true',
                         help='Use sparse FPS retrieval pairing instead of complete graph')
     parser.add_argument('--sparse_ga', action='store_true',
-                        help=f'Force SparseGA aligner (auto-enabled above {SPARSE_GA_THRESHOLD} frames)')
-    parser.add_argument('--no_sparse_ga', action='store_true',
-                        help='Force PointCloudOptimizer even above threshold (may OOM)')
+                        help='Use SparseGA aligner (memory-bounded, scales to many frames)')
 
     args = parser.parse_args()
     main(args.source_path, args.model_path, args.ckpt_path, args.device, args.batch_size, args.image_size,
          args.schedule, args.lr, args.niter, args.min_conf_thr, args.llffhold, args.n_views,
          args.co_vis_dsp, args.depth_thre, args.conf_aware_ranking, args.focal_avg, args.infer_video,
          args.max_init_points, args.sparse_pairs,
-         use_sparse_ga=args.sparse_ga, force_dense_ga=args.no_sparse_ga)
+         use_sparse_ga=args.sparse_ga)

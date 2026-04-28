@@ -38,6 +38,7 @@ MAX_INIT_POINTS=""
 SMART_FRAMES=0
 SMART_FPS=5.0
 SPARSE_PAIRS=0
+SPARSE_GA=0
 FRAMES_ONLY=0
 IMAGE_SIZE=256
 # Per-video lists (comma-separated, one entry per video)
@@ -59,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --smart-fps)    SMART_FPS="$2";    shift 2 ;;
         --frames-only)  FRAMES_ONLY=1;     shift ;;
         --sparse-pairs) SPARSE_PAIRS=1;    shift ;;
+        --sparse-ga)    SPARSE_GA=1;       shift ;;
         --image-size)   IMAGE_SIZE="$2";   shift 2 ;;
         --fps-list)     FPS_LIST="$2";     shift 2 ;;
         --nframes-list) NFRAMES_LIST="$2"; shift 2 ;;
@@ -222,6 +224,7 @@ MAST3R_START=$(date +%s)
 INIT_GEO_ARGS=""
 [[ -n "$MAX_INIT_POINTS" ]] && INIT_GEO_ARGS="--max_init_points $MAX_INIT_POINTS"
 [[ "$SPARSE_PAIRS" == "1" ]] && INIT_GEO_ARGS="$INIT_GEO_ARGS --sparse_pairs"
+[[ "$SPARSE_GA"    == "1" ]] && INIT_GEO_ARGS="$INIT_GEO_ARGS --sparse_ga"
 # image_size controls MASt3R pose estimation resolution; train.py always uses full-res originals.
 # 256 = 40+ frames on 8GB GPU; 512 = best init quality but OOMs above ~14 frames.
 CUDA_VISIBLE_DEVICES=0 "$PYTHON" -W ignore ./init_geo.py \
