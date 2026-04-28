@@ -13,6 +13,7 @@ ic(torch.cuda.device_count())
 from mast3r.model import AsymmetricMASt3R
 from mast3r.image_pairs import make_pairs
 from mast3r.retrieval.graph import make_pairs_fps
+from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
 from dust3r.inference import inference
 from dust3r.utils.device import to_numpy
 from dust3r.utils.geometry import inv
@@ -21,6 +22,11 @@ from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D, sav
                              init_filestructure, get_sorted_image_files, split_train_test, load_images, compute_co_vis_masks)
 from utils.camera_utils import generate_interpolated_path
 
+
+# Auto-switch to SparseGA above this frame count to avoid GPU OOM.
+# Raised to 100: image_size=256 lets PointCloudOptimizer handle 40+ frames without OOM.
+# (Was 12 when image_size=512; SparseGA gave noticeably worse quality so we avoid it.)
+SPARSE_GA_THRESHOLD = 100
 
 
 @torch.no_grad()
@@ -37,9 +43,11 @@ def _compute_sim_matrix(model, images, device):
 
 
 def main(source_path, model_path, ckpt_path, device, batch_size, image_size, schedule, lr, niter,
-         min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False, focal_avg=False, infer_video=False, max_init_points=None, sparse_pairs=False):
+         min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False,
+         focal_avg=False, infer_video=False, max_init_points=None, sparse_pairs=False,
+         use_sparse_ga=False, force_dense_ga=False):
 
-    # ---------------- (1) Load model and images ----------------  
+    # ---------------- (1) Load model and images ----------------
     save_path, sparse_0_path, sparse_1_path = init_filestructure(Path(source_path), n_views)
     model = AsymmetricMASt3R.from_pretrained(ckpt_path).to(device)
     image_dir = Path(source_path) / 'images'
@@ -48,10 +56,18 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
         train_img_files = image_files
     else:
         train_img_files, test_img_files = split_train_test(image_files, llffhold, n_views, verbose=True)
-    
-    # when geometry init, only use train images
+
     image_files = train_img_files
     images, org_imgs_shape = load_images(image_files, size=image_size)
+
+    # Decide which aligner to use
+    do_sparse_ga = (use_sparse_ga or len(images) > SPARSE_GA_THRESHOLD) and not force_dense_ga
+    print(f'>> Aligner: {"SparseGA" if do_sparse_ga else "PointCloudOptimizer"} ({len(images)} frames, threshold={SPARSE_GA_THRESHOLD})')
+
+    # Auto-cap init points for SparseGA to avoid 3DGS training OOM
+    if do_sparse_ga and max_init_points is None:
+        max_init_points = 1_500_000
+        print(f'>> Auto-capping max_init_points to {max_init_points:,} (SparseGA mode)')
 
     start_time = time()
     print(f'>> Making pairs...')
@@ -65,50 +81,89 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
     else:
         pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
         print(f'>> Complete graph: {len(pairs)//2} unique pairs ({len(images)} images)')
-    print(f'>> Inference...')
-    output = inference(pairs, model, device, batch_size=1, verbose=True)
-    del model
-    torch.cuda.empty_cache()
-    print(f'>> Global alignment...')
-    scene = global_aligner(output, device=args.device, mode=GlobalAlignerMode.PointCloudOptimizer)
-    loss = scene.compute_global_alignment(init="mst", niter=300, schedule=schedule, lr=lr, focal_avg=args.focal_avg)
 
-    # Extract scene information
-    extrinsics_w2c = inv(to_numpy(scene.get_im_poses()))
-    intrinsics = to_numpy(scene.get_intrinsics())
-    focals = to_numpy(scene.get_focals())
-    imgs = np.array(scene.imgs)
-    pts3d = to_numpy(scene.get_pts3d())
-    pts3d = np.array(pts3d)
-    depthmaps = to_numpy(scene.im_depthmaps.detach().cpu().numpy())
-    values = [param.detach().cpu().numpy() for param in scene.im_conf]
-    confs = np.array(values)
-    
+    # ---------------- (2a) SparseGA path (memory-bounded, scales to 50+ frames) ----------------
+    if do_sparse_ga:
+        print(f'>> SparseGA inference + alignment (pairs cached to disk)...')
+        cache_path = str(Path(model_path) / 'sparse_ga_cache')
+        image_paths = [str(f) for f in image_files]
+
+        scene = sparse_global_alignment(
+            image_paths, pairs, cache_path, model,
+            lr1=0.07, niter1=500, lr2=0.014, niter2=200,
+            device=device, dtype=torch.float32,
+            shared_intrinsics=focal_avg,
+        )
+        del model
+        torch.cuda.empty_cache()
+
+        extrinsics_w2c = inv(to_numpy(scene.get_im_poses()))
+        focals = to_numpy(scene.get_focals())
+        imgs = np.array(scene.imgs)
+
+        # Build intrinsic matrices from focal + principal point
+        pps = to_numpy(scene.get_principal_points())  # (N, 2)
+        H, W = imgs.shape[1], imgs.shape[2]
+        intrinsics = np.array([
+            [[f, 0, pps[i, 0]], [0, f, pps[i, 1]], [0, 0, 1]]
+            for i, f in enumerate(focals)
+        ])
+
+        print(f'>> Densifying point cloud from cached canonical views...')
+        pts3d_list, dm_list, conf_list = scene.get_dense_pts3d(clean_depth=True)
+        H, W = imgs.shape[1], imgs.shape[2]
+        pts3d     = np.array([to_numpy(p).reshape(H, W, 3) for p in pts3d_list])
+        depthmaps = np.array([to_numpy(d).reshape(H, W)   for d in dm_list])
+        confs     = np.array([to_numpy(c).reshape(H, W)   for c in conf_list])
+
+    # ---------------- (2b) PointCloudOptimizer path (best quality, ≤12 frames) ----------------
+    else:
+        print(f'>> Inference...')
+        output = inference(pairs, model, device, batch_size=1, verbose=True)
+        del model
+        torch.cuda.empty_cache()
+        print(f'>> Global alignment...')
+        scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer)
+        loss = scene.compute_global_alignment(init="mst", niter=300, schedule=schedule, lr=lr, focal_avg=focal_avg)
+
+        extrinsics_w2c = inv(to_numpy(scene.get_im_poses()))
+        intrinsics = to_numpy(scene.get_intrinsics())
+        focals = to_numpy(scene.get_focals())
+        imgs = np.array(scene.imgs)
+        pts3d = to_numpy(scene.get_pts3d())
+        pts3d = np.array(pts3d)
+        depthmaps = to_numpy(scene.im_depthmaps.detach().cpu().numpy())
+        values = [param.detach().cpu().numpy() for param in scene.im_conf]
+        confs = np.array(values)
+
+    # ---------------- (3) Confidence-aware ranking ----------------
     if conf_aware_ranking:
-        print(f'>> Confiden-aware Ranking...')
+        print(f'>> Confidence-aware ranking...')
         avg_conf_scores = confs.mean(axis=(1, 2))
         sorted_conf_indices = np.argsort(avg_conf_scores)[::-1]
-        sorted_conf_avg_conf_scores = avg_conf_scores[sorted_conf_indices]
         print("Sorted indices:", sorted_conf_indices)
-        print("Sorted average confidence scores:", sorted_conf_avg_conf_scores)
+        print("Sorted avg confidence:", avg_conf_scores[sorted_conf_indices])
     else:
         sorted_conf_indices = np.arange(n_views)
         print("Sorted indices:", sorted_conf_indices)
 
-    # Calculate the co-visibility mask
+    # ---------------- (4) Co-visibility mask ----------------
+    # SparseGA returns sparse anchor-based depthmaps incompatible with compute_co_vis_masks;
+    # skip masking in that path (it's an optimisation, not required for correctness).
     print(f'>> Calculate the co-visibility mask...')
-    if depth_thre > 0:
+    if depth_thre > 0 and not do_sparse_ga:
         overlapping_masks = compute_co_vis_masks(sorted_conf_indices, depthmaps, pts3d, intrinsics, extrinsics_w2c, imgs.shape, depth_threshold=depth_thre)
         overlapping_masks = ~overlapping_masks
     else:
         co_vis_dsp = False
         overlapping_masks = None
+
     end_time = time()
     Train_Time = end_time - start_time
     print(f"Time taken for {n_views} views: {Train_Time} seconds")
     save_time(model_path, '[1] coarse_init_TrainTime', Train_Time)
 
-    # ---------------- (2) Interpolate training pose to get initial testing pose ----------------
+    # ---------------- (5) Interpolate test poses (novel-view mode only) ----------------
     if not infer_video:
         n_train = len(train_img_files)
         n_test = len(test_img_files)
@@ -139,9 +194,8 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
         save_extrinsic(sparse_1_path, pose_test_init, test_img_files, image_suffix)
         test_focals = np.repeat(focals[0], n_test)
         save_intrinsics(sparse_1_path, test_focals, org_imgs_shape, imgs.shape, save_focals=False)
-    # -----------------------------------------------------------------------------------------
 
-    # Save results
+    # ---------------- (6) Save results ----------------
     focals = np.repeat(focals[0], n_views)
     print(f'>> Saving results...')
     end_time = time()
@@ -152,38 +206,44 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
     if max_init_points is not None:
         save_pts_kwargs['max_pts_num'] = max_init_points
     pts_num = save_points3D(sparse_0_path, imgs, pts3d, confs.reshape(pts3d.shape[0], -1), overlapping_masks, **save_pts_kwargs)
-    save_images_and_masks(sparse_0_path, n_views, imgs, overlapping_masks, image_files, image_suffix)
+    if overlapping_masks is not None:
+        save_images_and_masks(sparse_0_path, n_views, imgs, overlapping_masks, image_files, image_suffix)
     print(f'[INFO] MASt3R Reconstruction is successfully converted to COLMAP files in: {str(sparse_0_path)}')
-    print(f'[INFO] Number of points: {pts3d.reshape(-1, 3).shape[0]}')    
+    print(f'[INFO] Number of points: {pts3d.reshape(-1, 3).shape[0]}')
     print(f'[INFO] Number of points after downsampling: {pts_num}')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process images and save results.')
-    parser.add_argument('--source_path', '-s', type=str, required=True, help='Directory containing images')
-    parser.add_argument('--model_path', '-m', type=str, required=True, help='Directory to save the results')
+    parser.add_argument('--source_path', '-s', type=str, required=True)
+    parser.add_argument('--model_path', '-m', type=str, required=True)
     parser.add_argument('--ckpt_path', type=str,
-        default='./mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth', help='Path to the model checkpoint')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use for inference')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for processing images')
-    parser.add_argument('--image_size', type=int, default=512, help='Size to resize images')
-    parser.add_argument('--schedule', type=str, default='cosine', help='Learning rate schedule')
-    parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
-    parser.add_argument('--niter', type=int, default=300, help='Number of iterations')
-    parser.add_argument('--min_conf_thr', type=float, default=5, help='Minimum confidence threshold')
-    parser.add_argument('--llffhold', type=int, default=8, help='')
-    parser.add_argument('--n_views', type=int, default=3, help='')
-    # parser.add_argument('--focal_avg', type=bool, default=False, help='')
-    parser.add_argument('--focal_avg', action="store_true")
-    parser.add_argument('--conf_aware_ranking', action="store_true")
-    parser.add_argument('--co_vis_dsp', action="store_true")
-    parser.add_argument('--depth_thre', type=float, default=0.01, help='Depth threshold')
-    parser.add_argument('--infer_video', action="store_true")
+        default='./mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth')
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--image_size', type=int, default=512)
+    parser.add_argument('--schedule', type=str, default='cosine')
+    parser.add_argument('--lr', type=float, default=0.01)
+    parser.add_argument('--niter', type=int, default=300)
+    parser.add_argument('--min_conf_thr', type=float, default=5)
+    parser.add_argument('--llffhold', type=int, default=8)
+    parser.add_argument('--n_views', type=int, default=3)
+    parser.add_argument('--focal_avg', action='store_true')
+    parser.add_argument('--conf_aware_ranking', action='store_true')
+    parser.add_argument('--co_vis_dsp', action='store_true')
+    parser.add_argument('--depth_thre', type=float, default=0.01)
+    parser.add_argument('--infer_video', action='store_true')
     parser.add_argument('--max_init_points', type=int, default=None,
                         help='Cap initial point cloud size (confidence-weighted downsample)')
     parser.add_argument('--sparse_pairs', action='store_true',
-                        help='Use sparse FPS retrieval pairing instead of complete graph (saves GPU memory for large frame counts)')
+                        help='Use sparse FPS retrieval pairing instead of complete graph')
+    parser.add_argument('--sparse_ga', action='store_true',
+                        help=f'Force SparseGA aligner (auto-enabled above {SPARSE_GA_THRESHOLD} frames)')
+    parser.add_argument('--no_sparse_ga', action='store_true',
+                        help='Force PointCloudOptimizer even above threshold (may OOM)')
 
     args = parser.parse_args()
-    main(args.source_path, args.model_path, args.ckpt_path, args.device, args.batch_size, args.image_size, args.schedule, args.lr, args.niter,
-          args.min_conf_thr, args.llffhold, args.n_views, args.co_vis_dsp, args.depth_thre, args.conf_aware_ranking, args.focal_avg, args.infer_video,
-          args.max_init_points, args.sparse_pairs)
+    main(args.source_path, args.model_path, args.ckpt_path, args.device, args.batch_size, args.image_size,
+         args.schedule, args.lr, args.niter, args.min_conf_thr, args.llffhold, args.n_views,
+         args.co_vis_dsp, args.depth_thre, args.conf_aware_ranking, args.focal_avg, args.infer_video,
+         args.max_init_points, args.sparse_pairs,
+         use_sparse_ga=args.sparse_ga, force_dense_ga=args.no_sparse_ga)

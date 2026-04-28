@@ -38,6 +38,8 @@ MAX_INIT_POINTS=""
 SMART_FRAMES=0
 SMART_FPS=5.0
 SPARSE_PAIRS=0
+FRAMES_ONLY=0
+IMAGE_SIZE=256
 # Per-video lists (comma-separated, one entry per video)
 FPS_LIST=""
 NFRAMES_LIST=""
@@ -55,7 +57,9 @@ while [[ $# -gt 0 ]]; do
         --max-init-points) MAX_INIT_POINTS="$2"; shift 2 ;;
         --smart-frames) SMART_FRAMES=1;    shift ;;
         --smart-fps)    SMART_FPS="$2";    shift 2 ;;
+        --frames-only)  FRAMES_ONLY=1;     shift ;;
         --sparse-pairs) SPARSE_PAIRS=1;    shift ;;
+        --image-size)   IMAGE_SIZE="$2";   shift 2 ;;
         --fps-list)     FPS_LIST="$2";     shift 2 ;;
         --nframes-list) NFRAMES_LIST="$2"; shift 2 ;;
         --start-list)   START_LIST="$2";   shift 2 ;;
@@ -86,7 +90,8 @@ USAGE="Usage:
 
 [[ ${#VIDEOS[@]} -eq 0 ]] && { echo "$USAGE"; exit 1; }
 [[ -z "$SCENE" ]]          && { echo "Error: --scene is required"; echo "$USAGE"; exit 1; }
-[[ -z "$ITERS" ]]          && { echo "Error: --iters is required"; echo "$USAGE"; exit 1; }
+[[ -z "$ITERS" && "$FRAMES_ONLY" != "1" ]] && { echo "Error: --iters is required"; echo "$USAGE"; exit 1; }
+ITERS="${ITERS:-0}"
 
 if [[ -n "$FPS_LIST" && -n "$NFRAMES_LIST" ]]; then
     echo "Error: --fps-list and --nframes-list are mutually exclusive"; exit 1
@@ -108,11 +113,16 @@ done
 SCENE_DIR="$REPO/assets/examples/$SCENE"
 IMAGE_DIR="$SCENE_DIR/images"
 MODEL_DIR="$REPO/output_infer/$SCENE"
+mkdir -p "$MODEL_DIR"
 
 # ── Step 1: extract frames from all videos into one dir ───────────────────────
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  video_to_splat: $SCENE  (${#VIDEOS[@]} video(s))"
+echo "╠══════════════════════════════════════════════════════╣"
+echo "║  Watch logs:"
+echo "║    tail -f $MODEL_DIR/01_init_geo.log"
+echo "║    tail -f $MODEL_DIR/02_train.log"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
@@ -152,11 +162,21 @@ for VIDEO in "${VIDEOS[@]}"; do
             --start "$VSTART" \
             --duration "$VDURATION" \
             --out "$TMP_SEL"
+        IN_SEL=$(ls "$TMP_SEL/selected/frame_"*.png 2>/dev/null | wc -l)
+        echo ">> [frames] select_frames wrote $IN_SEL file(s) to $TMP_SEL/selected/"
+        echo ">> [frames] exact contents: $(ls -1 "$TMP_SEL/selected/" 2>/dev/null | tr '\n' ' ')"
+        VID_STEM=$(basename "$VIDEO" | sed 's/\.[^.]*$//')
         DEST_IDX=$FRAME_OFFSET
         for f in $(ls "$TMP_SEL/selected/frame_"*.png 2>/dev/null | sort); do
-            cp "$f" "$IMAGE_DIR/$(printf 'frame_%04d.png' $DEST_IDX)"
+            # Compute timestamp: frame_NNNN → index NNNN-1 → time = (NNNN-1)/SMART_FPS + VSTART
+            FNUM=$(basename "$f" | sed 's/frame_0*\([0-9]*\)\.png/\1/')
+            TSEC=$(awk "BEGIN {printf \"%07.2f\", ($FNUM - 1) / $SMART_FPS + $VSTART}")
+            DESTNAME="${SCENE}_${VID_STEM}_t${TSEC}s.png"
+            cp "$f" "$IMAGE_DIR/$DESTNAME"
             DEST_IDX=$(( DEST_IDX + 1 ))
         done
+        COPIED=$(( DEST_IDX - FRAME_OFFSET ))
+        echo ">> [frames] copied $COPIED frame(s) into $IMAGE_DIR (indices $FRAME_OFFSET..$(( DEST_IDX - 1 )))"
         rm -rf "$TMP_SEL"
     else
         echo "[1/3] $(basename "$VIDEO"): $VN_FRAMES frames over ${VDURATION}s at ${VFPS}fps (start=${VSTART}s, offset=$FRAME_OFFSET)..."
@@ -170,13 +190,23 @@ for VIDEO in "${VIDEOS[@]}"; do
             "$IMAGE_DIR/frame_%04d.png"
     fi
 
-    EXTRACTED=$(ls "$IMAGE_DIR"/frame_*.png 2>/dev/null | wc -l)
+    EXTRACTED=$(ls "$IMAGE_DIR"/*.png 2>/dev/null | wc -l)
     FRAME_OFFSET=$(( EXTRACTED + 1 ))
     VIDEO_IDX=$(( VIDEO_IDX + 1 ))
 done
 
-TOTAL_FRAMES=$(ls "$IMAGE_DIR"/frame_*.png 2>/dev/null | wc -l)
+TOTAL_FRAMES=$(ls "$IMAGE_DIR"/*.png 2>/dev/null | wc -l)
 echo "    → $TOTAL_FRAMES total frames (PNG) → $IMAGE_DIR"
+echo ">> [frames] all files in IMAGE_DIR: $(ls "$IMAGE_DIR"/*.png 2>/dev/null | xargs -n1 basename | tr '\n' ' ')"
+
+if [[ "$FRAMES_ONLY" == "1" ]]; then
+    echo ""
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║  --frames-only: stopping after frame extraction"
+    echo "║  $TOTAL_FRAMES frames in $IMAGE_DIR"
+    echo "╚══════════════════════════════════════════════════════╝"
+    exit 0
+fi
 
 PIPELINE_START=$(date +%s)
 
@@ -192,10 +222,13 @@ MAST3R_START=$(date +%s)
 INIT_GEO_ARGS=""
 [[ -n "$MAX_INIT_POINTS" ]] && INIT_GEO_ARGS="--max_init_points $MAX_INIT_POINTS"
 [[ "$SPARSE_PAIRS" == "1" ]] && INIT_GEO_ARGS="$INIT_GEO_ARGS --sparse_pairs"
+# image_size controls MASt3R pose estimation resolution; train.py always uses full-res originals.
+# 256 = 40+ frames on 8GB GPU; 512 = best init quality but OOMs above ~14 frames.
 CUDA_VISIBLE_DEVICES=0 "$PYTHON" -W ignore ./init_geo.py \
     -s "$SCENE_DIR" \
     -m "$MODEL_DIR" \
     --n_views "$TOTAL_FRAMES" \
+    --image_size "$IMAGE_SIZE" \
     --focal_avg \
     --co_vis_dsp \
     --conf_aware_ranking \
