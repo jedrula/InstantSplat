@@ -41,6 +41,7 @@ SPARSE_PAIRS=0
 SPARSE_GA=0
 FRAMES_ONLY=0
 IMAGE_SIZE=256
+MODEL_DIR_OVERRIDE=""
 # Per-video lists (comma-separated, one entry per video)
 FPS_LIST=""
 NFRAMES_LIST=""
@@ -62,6 +63,7 @@ while [[ $# -gt 0 ]]; do
         --sparse-pairs) SPARSE_PAIRS=1;    shift ;;
         --sparse-ga)    SPARSE_GA=1;       shift ;;
         --image-size)   IMAGE_SIZE="$2";   shift 2 ;;
+        --model-dir)    MODEL_DIR_OVERRIDE="$2"; shift 2 ;;
         --fps-list)     FPS_LIST="$2";     shift 2 ;;
         --nframes-list) NFRAMES_LIST="$2"; shift 2 ;;
         --start-list)   START_LIST="$2";   shift 2 ;;
@@ -114,7 +116,9 @@ done
 
 SCENE_DIR="$REPO/assets/examples/$SCENE"
 IMAGE_DIR="$SCENE_DIR/images"
-MODEL_DIR="$REPO/output_infer/$SCENE"
+# --model-dir lets callers (e.g. the server) isolate outputs per-job;
+# manual runs default to the shared output_infer/$SCENE/ directory.
+MODEL_DIR="${MODEL_DIR_OVERRIDE:-$REPO/output_infer/$SCENE}"
 mkdir -p "$MODEL_DIR"
 
 # ── Step 1: extract frames from all videos into one dir ───────────────────────
