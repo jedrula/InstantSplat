@@ -67,7 +67,12 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
 
     start_time = time()
     print(f'>> Making pairs...')
-    if sparse_pairs:
+    # SparseGA requires every image to appear in at least one pair (it builds a
+    # full correspondence graph over all N images). Sparse FPS pairs can leave
+    # some images isolated, causing CUDA index-out-of-bounds inside condense_data.
+    # SparseGA already handles memory by caching to disk, so sparse pairs add no
+    # benefit there — always use the complete graph when SparseGA is active.
+    if sparse_pairs and not do_sparse_ga:
         sim_mat = _compute_sim_matrix(model, images, device)
         Na = max(8, len(images) // 2)
         fps_pairs, _ = make_pairs_fps(sim_mat, Na=Na, tokK=4)
@@ -75,6 +80,8 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
         pairs += [(images[j], images[i]) for i, j in fps_pairs]  # symmetrize
         print(f'>> Sparse pairs: {len(fps_pairs)} unique ({len(images)} images, Na={Na})')
     else:
+        if sparse_pairs and do_sparse_ga:
+            print(f'>> Ignoring sparse_pairs: SparseGA requires complete graph (all images connected)')
         pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
         print(f'>> Complete graph: {len(pairs)//2} unique pairs ({len(images)} images)')
 
