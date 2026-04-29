@@ -221,6 +221,9 @@ mkdir -p "$MODEL_DIR"
 cd "$REPO"
 
 MAST3R_START=$(date +%s)
+# Clear any cache left by a previous crashed run; stale SparseGA cache causes
+# device-side assert when tensor shapes no longer match the new image set.
+rm -rf "$MODEL_DIR/sparse_ga_cache"
 INIT_GEO_ARGS=""
 [[ -n "$MAX_INIT_POINTS" ]] && INIT_GEO_ARGS="--max_init_points $MAX_INIT_POINTS"
 [[ "$SPARSE_PAIRS" == "1" ]] && INIT_GEO_ARGS="$INIT_GEO_ARGS --sparse_pairs"
