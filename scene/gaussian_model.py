@@ -344,6 +344,8 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            if group["name"] == "pose":
+                continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -357,6 +359,8 @@ class GaussianModel:
             else:
                 group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
+            if "per_point_lr" in group and group["per_point_lr"] is not None:
+                group["per_point_lr"] = group["per_point_lr"][mask]
         return optimizable_tensors
 
     def prune_points(self, mask):
@@ -371,13 +375,16 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.per_point_lr is not None:
+            self.per_point_lr = self.per_point_lr[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            if group["name"] == "pose":
+                continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -394,6 +401,10 @@ class GaussianModel:
             else:
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
+            if "per_point_lr" in group and group["per_point_lr"] is not None:
+                n_new = extension_tensor.shape[0]
+                new_lr = torch.zeros((n_new, 1), dtype=group["per_point_lr"].dtype, device=group["per_point_lr"].device)
+                group["per_point_lr"] = torch.cat((group["per_point_lr"], new_lr), dim=0)
 
         return optimizable_tensors
 
