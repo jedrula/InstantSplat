@@ -661,7 +661,7 @@ def main():
         shutil.rmtree(sel_dir)
     sel_dir.mkdir(parents=True)
     for fd in frame_data:
-        if fd['status'] == 'selected':
+        if fd['status'] in ('selected', 'no_overlap'):
             shutil.copy2(fd['path'], sel_dir / Path(fd['path']).name)
 
     # ── 4. Thumbnails ─────────────────────────────────────────────────────────

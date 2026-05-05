@@ -910,6 +910,11 @@ def anchor_depth_offsets(canon_depth, pixels, subsample=8):
 
     for img2, (xy1, _confs) in pixels.items():
         px, py = xy1.long().T
+        # Clamp to valid range: rare boundary correspondences can land exactly at
+        # the image edge (px==W1 or py==H1), causing CUDA index OOB in core_depth/canon_depth.
+        # Clamping is safe — the depth at the nearest valid pixel is a negligible approximation.
+        px = px.clamp(0, W1 - 1)
+        py = py.clamp(0, H1 - 1)
 
         # find nearest anchor == block quantization
         core_idx = (py // subsample) * W2 + (px // subsample)

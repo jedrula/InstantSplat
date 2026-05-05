@@ -9,11 +9,15 @@
 #   bash video_to_splat.sh v1.mp4 v2.mp4 --scene NAME --n-frames N --duration S --iters N
 #   (--n-frames / --duration apply per video; total frames = n_videos × n_frames)
 #
+# Skip frame extraction (images already in assets/examples/$SCENE/images/):
+#   bash video_to_splat.sh --skip-extraction --scene NAME --iters N [options]
+#
 # Required:
 #   --scene NAME     scene name / output folder (always required)
 #   --iters N        3DGS training iterations
 #   mode A: --n-frames N  AND  --duration S
 #   mode B: --fps F   (--duration optional; omit to use full video length)
+#   mode C: --skip-extraction  (no video files needed; fps/n-frames also not needed)
 #
 # Optional:
 #   --start T        start time in video, e.g. 00:00:05 (default: 0)
@@ -21,6 +25,7 @@
 # Examples:
 #   bash video_to_splat.sh v.mp4 --scene wall --n-frames 3 --duration 6 --iters 1000
 #   bash video_to_splat.sh v1.mp4 v2.mp4 --scene wall --n-frames 3 --duration 6 --iters 1000
+#   bash video_to_splat.sh --skip-extraction --scene wall --iters 1000
 
 set -eo pipefail
 
@@ -40,6 +45,7 @@ SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
 FRAMES_ONLY=0
+SKIP_EXTRACTION=0
 IMAGE_SIZE=256
 MODEL_DIR_OVERRIDE=""
 # Per-video lists (comma-separated, one entry per video)
@@ -60,6 +66,7 @@ while [[ $# -gt 0 ]]; do
         --smart-frames) SMART_FRAMES=1;    shift ;;
         --smart-fps)    SMART_FPS="$2";    shift 2 ;;
         --frames-only)  FRAMES_ONLY=1;     shift ;;
+        --skip-extraction) SKIP_EXTRACTION=1; shift ;;
         --sparse-pairs) SPARSE_PAIRS=1;    shift ;;
         --sparse-ga)    SPARSE_GA=1;       shift ;;
         --image-size)   IMAGE_SIZE="$2";   shift 2 ;;
@@ -92,16 +99,18 @@ USAGE="Usage:
     --fps-list F1,F2,...   OR  --nframes-list N1,N2,...
     --start-list S1,S2,...  --duration-list D1,D2,..."
 
-[[ ${#VIDEOS[@]} -eq 0 ]] && { echo "$USAGE"; exit 1; }
+[[ "$SKIP_EXTRACTION" != "1" && ${#VIDEOS[@]} -eq 0 ]] && { echo "$USAGE"; exit 1; }
 [[ -z "$SCENE" ]]          && { echo "Error: --scene is required"; echo "$USAGE"; exit 1; }
 [[ -z "$ITERS" && "$FRAMES_ONLY" != "1" ]] && { echo "Error: --iters is required"; echo "$USAGE"; exit 1; }
 ITERS="${ITERS:-0}"
 
-if [[ -n "$FPS_LIST" && -n "$NFRAMES_LIST" ]]; then
-    echo "Error: --fps-list and --nframes-list are mutually exclusive"; exit 1
-fi
-if [[ -z "$FPS_LIST" && -z "$NFRAMES_LIST" ]]; then
-    echo "Error: provide either --fps-list or --nframes-list"; echo "$USAGE"; exit 1
+if [[ "$SKIP_EXTRACTION" != "1" ]]; then
+    if [[ -n "$FPS_LIST" && -n "$NFRAMES_LIST" ]]; then
+        echo "Error: --fps-list and --nframes-list are mutually exclusive"; exit 1
+    fi
+    if [[ -z "$FPS_LIST" && -z "$NFRAMES_LIST" ]]; then
+        echo "Error: provide either --fps-list or --nframes-list"; echo "$USAGE"; exit 1
+    fi
 fi
 
 # Split comma-separated lists into arrays
@@ -121,98 +130,122 @@ IMAGE_DIR="$SCENE_DIR/images"
 MODEL_DIR="${MODEL_DIR_OVERRIDE:-$REPO/output_infer/$SCENE}"
 mkdir -p "$MODEL_DIR"
 
-# ── Step 1: extract frames from all videos into one dir ───────────────────────
-echo ""
-echo "╔══════════════════════════════════════════════════════╗"
-echo "║  video_to_splat: $SCENE  (${#VIDEOS[@]} video(s))"
-echo "╠══════════════════════════════════════════════════════╣"
-echo "║  Watch logs:"
-echo "║    tail -f $MODEL_DIR/01_init_geo.log"
-echo "║    tail -f $MODEL_DIR/02_train.log"
-echo "╚══════════════════════════════════════════════════════╝"
-echo ""
-
-rm -rf "$IMAGE_DIR"
-mkdir -p "$IMAGE_DIR"
-
-FRAME_OFFSET=1
-VIDEO_IDX=0
-for VIDEO in "${VIDEOS[@]}"; do
-    # Per-video start time (default 0)
-    VSTART="${_START_ARR[$VIDEO_IDX]:-0}"
-    [[ -z "$VSTART" ]] && VSTART=0
-
-    # Per-video duration: use provided value, else probe full video minus start
-    VDURATION="${_DURATION_ARR[$VIDEO_IDX]:-}"
-    if [[ -z "$VDURATION" ]]; then
-        FULL_DUR=$(ffprobe -v error -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 "$VIDEO" | awk '{printf "%.3f", $1}')
-        VDURATION=$(awk "BEGIN {printf \"%.3f\", $FULL_DUR - $VSTART}")
+if [[ "$SKIP_EXTRACTION" == "1" ]]; then
+    # ── Skip frame extraction: images already in IMAGE_DIR ───────────────────
+    if [[ ! -d "$IMAGE_DIR" ]]; then
+        echo "Error: --skip-extraction requires images already in $IMAGE_DIR"
+        exit 1
     fi
-
-    # Per-video fps / n-frames
-    if [[ -n "$FPS_LIST" ]]; then
-        VFPS="${_FPS_ARR[$VIDEO_IDX]:-0.5}"
-        VN_FRAMES=$(awk "BEGIN {printf \"%d\", int($VFPS * $VDURATION + 0.5)}")
-    else
-        VN_FRAMES="${_NFRAMES_ARR[$VIDEO_IDX]:-3}"
-        VFPS=$(awk "BEGIN {printf \"%.4f\", $VN_FRAMES / $VDURATION}")
+    TOTAL_FRAMES=$(ls "$IMAGE_DIR" 2>/dev/null | grep -cE '\.(jpg|jpeg|png|webp)$' || true)
+    if [[ "$TOTAL_FRAMES" -lt 2 ]]; then
+        echo "Error: need at least 2 images in $IMAGE_DIR (found $TOTAL_FRAMES)"
+        exit 1
     fi
-
-    if [[ "$SMART_FRAMES" == "1" ]]; then
-        echo "[1/3] $(basename "$VIDEO"): smart-select $VN_FRAMES frames from ${VDURATION}s @ start=${VSTART}s (oversample ${SMART_FPS}fps, offset=$FRAME_OFFSET)..."
-        TMP_SEL=$(mktemp -d)
-        "$PYTHON" "$REPO/select_frames.py" "$VIDEO" \
-            --fps "$SMART_FPS" \
-            --target "$VN_FRAMES" \
-            --start "$VSTART" \
-            --duration "$VDURATION" \
-            --out "$TMP_SEL"
-        IN_SEL=$(ls "$TMP_SEL/selected/frame_"*.png 2>/dev/null | wc -l)
-        echo ">> [frames] select_frames wrote $IN_SEL file(s) to $TMP_SEL/selected/"
-        echo ">> [frames] exact contents: $(ls -1 "$TMP_SEL/selected/" 2>/dev/null | tr '\n' ' ')"
-        VID_STEM=$(basename "$VIDEO" | sed 's/\.[^.]*$//')
-        DEST_IDX=$FRAME_OFFSET
-        for f in $(ls "$TMP_SEL/selected/frame_"*.png 2>/dev/null | sort); do
-            # Compute timestamp: frame_NNNN → index NNNN-1 → time = (NNNN-1)/SMART_FPS + VSTART
-            FNUM=$(basename "$f" | sed 's/frame_0*\([0-9]*\)\.png/\1/')
-            TSEC=$(awk "BEGIN {printf \"%07.2f\", ($FNUM - 1) / $SMART_FPS + $VSTART}")
-            DESTNAME="${SCENE}_${VID_STEM}_t${TSEC}s.png"
-            cp "$f" "$IMAGE_DIR/$DESTNAME"
-            DEST_IDX=$(( DEST_IDX + 1 ))
-        done
-        COPIED=$(( DEST_IDX - FRAME_OFFSET ))
-        echo ">> [frames] copied $COPIED frame(s) into $IMAGE_DIR (indices $FRAME_OFFSET..$(( DEST_IDX - 1 )))"
-        rm -rf "$TMP_SEL"
-    else
-        echo "[1/3] $(basename "$VIDEO"): $VN_FRAMES frames over ${VDURATION}s at ${VFPS}fps (start=${VSTART}s, offset=$FRAME_OFFSET)..."
-        ffmpeg -y -loglevel error \
-            -ss "$VSTART" \
-            -t "$VDURATION" \
-            -i "$VIDEO" \
-            -vf "fps=$VFPS" \
-            -frames:v "$VN_FRAMES" \
-            -start_number "$FRAME_OFFSET" \
-            "$IMAGE_DIR/frame_%04d.png"
-    fi
-
-    EXTRACTED=$(ls "$IMAGE_DIR"/*.png 2>/dev/null | wc -l)
-    FRAME_OFFSET=$(( EXTRACTED + 1 ))
-    VIDEO_IDX=$(( VIDEO_IDX + 1 ))
-done
-
-TOTAL_FRAMES=$(ls "$IMAGE_DIR"/*.png 2>/dev/null | wc -l)
-echo "    → $TOTAL_FRAMES total frames (PNG) → $IMAGE_DIR"
-echo ">> [frames] all files in IMAGE_DIR: $(ls "$IMAGE_DIR"/*.png 2>/dev/null | xargs -n1 basename | tr '\n' ' ')"
-
-if [[ "$FRAMES_ONLY" == "1" ]]; then
     echo ""
     echo "╔══════════════════════════════════════════════════════╗"
-    echo "║  --frames-only: stopping after frame extraction"
-    echo "║  $TOTAL_FRAMES frames in $IMAGE_DIR"
+    echo "║  video_to_splat (--skip-extraction): $SCENE"
+    echo "║  Using $TOTAL_FRAMES pre-supplied image(s) from:"
+    echo "║    $IMAGE_DIR"
+    echo "╠══════════════════════════════════════════════════════╣"
+    echo "║  Watch logs:"
+    echo "║    tail -f $MODEL_DIR/01_init_geo.log"
+    echo "║    tail -f $MODEL_DIR/02_train.log"
     echo "╚══════════════════════════════════════════════════════╝"
-    exit 0
-fi
+    echo ""
+else
+    # ── Step 1: extract frames from all videos into one dir ──────────────────
+    echo ""
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║  video_to_splat: $SCENE  (${#VIDEOS[@]} video(s))"
+    echo "╠══════════════════════════════════════════════════════╣"
+    echo "║  Watch logs:"
+    echo "║    tail -f $MODEL_DIR/01_init_geo.log"
+    echo "║    tail -f $MODEL_DIR/02_train.log"
+    echo "╚══════════════════════════════════════════════════════╝"
+    echo ""
+
+    rm -rf "$IMAGE_DIR"
+    mkdir -p "$IMAGE_DIR"
+
+    FRAME_OFFSET=1
+    VIDEO_IDX=0
+    for VIDEO in "${VIDEOS[@]}"; do
+        # Per-video start time (default 0)
+        VSTART="${_START_ARR[$VIDEO_IDX]:-0}"
+        [[ -z "$VSTART" ]] && VSTART=0
+
+        # Per-video duration: use provided value, else probe full video minus start
+        VDURATION="${_DURATION_ARR[$VIDEO_IDX]:-}"
+        if [[ -z "$VDURATION" ]]; then
+            FULL_DUR=$(ffprobe -v error -show_entries format=duration \
+                -of default=noprint_wrappers=1:nokey=1 "$VIDEO" | awk '{printf "%.3f", $1}')
+            VDURATION=$(awk "BEGIN {printf \"%.3f\", $FULL_DUR - $VSTART}")
+        fi
+
+        # Per-video fps / n-frames
+        if [[ -n "$FPS_LIST" ]]; then
+            VFPS="${_FPS_ARR[$VIDEO_IDX]:-0.5}"
+            VN_FRAMES=$(awk "BEGIN {printf \"%d\", int($VFPS * $VDURATION + 0.5)}")
+        else
+            VN_FRAMES="${_NFRAMES_ARR[$VIDEO_IDX]:-3}"
+            VFPS=$(awk "BEGIN {printf \"%.4f\", $VN_FRAMES / $VDURATION}")
+        fi
+
+        if [[ "$SMART_FRAMES" == "1" ]]; then
+            echo "[1/3] $(basename "$VIDEO"): smart-select $VN_FRAMES frames from ${VDURATION}s @ start=${VSTART}s (oversample ${SMART_FPS}fps, offset=$FRAME_OFFSET)..."
+            TMP_SEL=$(mktemp -d)
+            "$PYTHON" "$REPO/select_frames.py" "$VIDEO" \
+                --fps "$SMART_FPS" \
+                --target "$VN_FRAMES" \
+                --start "$VSTART" \
+                --duration "$VDURATION" \
+                --out "$TMP_SEL"
+            IN_SEL=$(ls "$TMP_SEL/selected/frame_"*.png 2>/dev/null | wc -l)
+            echo ">> [frames] select_frames wrote $IN_SEL file(s) to $TMP_SEL/selected/"
+            echo ">> [frames] exact contents: $(ls -1 "$TMP_SEL/selected/" 2>/dev/null | tr '\n' ' ')"
+            VID_STEM=$(basename "$VIDEO" | sed 's/\.[^.]*$//')
+            DEST_IDX=$FRAME_OFFSET
+            for f in $(ls "$TMP_SEL/selected/frame_"*.png 2>/dev/null | sort); do
+                # Compute timestamp: frame_NNNN → index NNNN-1 → time = (NNNN-1)/SMART_FPS + VSTART
+                FNUM=$(basename "$f" | sed 's/frame_0*\([0-9]*\)\.png/\1/')
+                TSEC=$(awk "BEGIN {printf \"%07.2f\", ($FNUM - 1) / $SMART_FPS + $VSTART}")
+                DESTNAME="${SCENE}_${VID_STEM}_t${TSEC}s.png"
+                cp "$f" "$IMAGE_DIR/$DESTNAME"
+                DEST_IDX=$(( DEST_IDX + 1 ))
+            done
+            COPIED=$(( DEST_IDX - FRAME_OFFSET ))
+            echo ">> [frames] copied $COPIED frame(s) into $IMAGE_DIR (indices $FRAME_OFFSET..$(( DEST_IDX - 1 )))"
+            rm -rf "$TMP_SEL"
+        else
+            echo "[1/3] $(basename "$VIDEO"): $VN_FRAMES frames over ${VDURATION}s at ${VFPS}fps (start=${VSTART}s, offset=$FRAME_OFFSET)..."
+            ffmpeg -y -loglevel error \
+                -ss "$VSTART" \
+                -t "$VDURATION" \
+                -i "$VIDEO" \
+                -vf "fps=$VFPS" \
+                -frames:v "$VN_FRAMES" \
+                -start_number "$FRAME_OFFSET" \
+                "$IMAGE_DIR/frame_%04d.png"
+        fi
+
+        EXTRACTED=$(ls "$IMAGE_DIR"/*.png 2>/dev/null | wc -l)
+        FRAME_OFFSET=$(( EXTRACTED + 1 ))
+        VIDEO_IDX=$(( VIDEO_IDX + 1 ))
+    done
+
+    TOTAL_FRAMES=$(ls "$IMAGE_DIR"/*.png 2>/dev/null | wc -l)
+    echo "    → $TOTAL_FRAMES total frames (PNG) → $IMAGE_DIR"
+    echo ">> [frames] all files in IMAGE_DIR: $(ls "$IMAGE_DIR"/*.png 2>/dev/null | xargs -n1 basename | tr '\n' ' ')"
+
+    if [[ "$FRAMES_ONLY" == "1" ]]; then
+        echo ""
+        echo "╔══════════════════════════════════════════════════════╗"
+        echo "║  --frames-only: stopping after frame extraction"
+        echo "║  $TOTAL_FRAMES frames in $IMAGE_DIR"
+        echo "╚══════════════════════════════════════════════════════╝"
+        exit 0
+    fi
+fi  # end of extraction block
 
 PIPELINE_START=$(date +%s)
 
