@@ -47,13 +47,9 @@ def save_pose(path, quat_pose, train_cams, llffhold=2):
     # Get camera IDs and convert quaternion poses to camera matrices
     camera_ids = [cam.colmap_id for cam in train_cams]
     world_to_camera = [get_camera_from_tensor(quat) for quat in quat_pose]
-    
-    # Reorder poses according to colmap IDs
-    colmap_poses = []
-    for i in range(len(camera_ids)):
-        idx = camera_ids.index(i + 1)  # Find position of camera i+1
-        pose = world_to_camera[idx]
-        colmap_poses.append(pose)
+
+    # Sort poses by colmap_id (IDs may not be sequential when using COLMAP engine)
+    colmap_poses = [pose for _, pose in sorted(zip(camera_ids, world_to_camera), key=lambda x: x[0])]
     
     # Convert to numpy array and save
     colmap_poses = torch.stack(colmap_poses).detach().cpu().numpy()
@@ -94,12 +90,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
 
     # per-point-optimizer
-    confidence_path = os.path.join(dataset.source_path, f"sparse_{dataset.n_views}/0", "confidence_dsp.npy")
-    confidence_lr = load_and_prepare_confidence(confidence_path, device='cuda', scale=(1, 100))
+    confidence_lr = None
+    if opt.pp_optimizer:
+        confidence_path = os.path.join(dataset.source_path, f"sparse_{dataset.n_views}/0", "confidence_dsp.npy")
+        confidence_lr = load_and_prepare_confidence(confidence_path, device='cuda', scale=(1, 100))
     scene = Scene(dataset, gaussians)
 
     if opt.pp_optimizer:
-        gaussians.training_setup_pp(opt, confidence_lr)                          
+        gaussians.training_setup_pp(opt, confidence_lr)
     else:
         gaussians.training_setup(opt)
     if checkpoint:

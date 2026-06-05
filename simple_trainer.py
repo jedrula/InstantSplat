@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
+import viser.transforms as vtf
 import yaml
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
@@ -21,7 +22,10 @@ from datasets.traj import (
     generate_interpolated_path,
     generate_spiral_path,
 )
-from fused_ssim import fused_ssim
+try:
+    from fused_ssim import fused_ssim
+except ImportError:
+    fused_ssim = None
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -30,7 +34,10 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from gsplat_utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
-from gsplat import export_splats
+try:
+    from gsplat import export_splats
+except ImportError:
+    export_splats = None
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
@@ -47,6 +54,8 @@ except ImportError:
 class Config:
     # Disable viewer
     disable_viewer: bool = False
+    # Fast smoke mode: skip heavy COLMAP point-track loading in parser.
+    fast_init: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
@@ -58,6 +67,8 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
+    # Directory of per-image binary masks (e.g. DA3-refined wall masks). Filenames must match image names.
+    mask_dir: Optional[str] = None
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -73,6 +84,11 @@ class Config:
 
     # Port for the viewer server
     port: int = 8080
+    # Initialize viewer to a training camera pose on each client connect.
+    viewer_init_train_pose: bool = True
+    # Training camera index used for initial viewer pose.
+    # -1 means middle training camera.
+    viewer_init_train_index: int = -1
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
@@ -339,6 +355,8 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            fast_init=cfg.fast_init,
+            mask_dir=cfg.mask_dir,
         )
         self.trainset = Dataset(
             self.parser,
@@ -481,6 +499,50 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
+            self._register_initial_viewer_pose()
+
+    def _resolve_train_camera_index(self) -> Optional[int]:
+        if len(self.trainset.indices) == 0:
+            return None
+        cfg_idx = self.cfg.viewer_init_train_index
+        if cfg_idx < 0:
+            return len(self.trainset.indices) // 2
+        if cfg_idx >= len(self.trainset.indices):
+            return len(self.trainset.indices) - 1
+        return cfg_idx
+
+    def _get_initial_viewer_pose(self) -> Optional[Tuple[np.ndarray, float]]:
+        if not self.cfg.viewer_init_train_pose:
+            return None
+        train_idx = self._resolve_train_camera_index()
+        if train_idx is None:
+            return None
+
+        parser_idx = int(self.trainset.indices[train_idx])
+        c2w = self.parser.camtoworlds[parser_idx].astype(np.float32)
+        camera_id = self.parser.camera_ids[parser_idx]
+        K = self.parser.Ks_dict[camera_id]
+        _, height = self.parser.imsize_dict[camera_id]
+        fy = float(K[1, 1])
+        if fy <= 0:
+            return c2w, 1.0
+        fov = float(2.0 * np.arctan(height / (2.0 * fy)))
+        return c2w, fov
+
+    def _register_initial_viewer_pose(self) -> None:
+        init_pose = self._get_initial_viewer_pose()
+        if init_pose is None:
+            return
+
+        c2w, fov = init_pose
+        pos = c2w[:3, 3]
+        wxyz = vtf.SO3.from_matrix(c2w[:3, :3]).wxyz
+
+        @self.server.on_client_connect
+        def _set_initial_pose(client: viser.ClientHandle):
+            client.camera.position = pos
+            client.camera.wxyz = wxyz
+            client.camera.fov = fov
 
     def rasterize_splats(
         self,
@@ -684,9 +746,13 @@ class Runner:
 
             # loss
             l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
+            if fused_ssim is not None and cfg.ssim_lambda > 0.0:
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+            else:
+                # Keep training functional when fused_ssim is unavailable.
+                ssimloss = torch.tensor(0.0, device=device)
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # query depths from depth map
@@ -784,7 +850,7 @@ class Runner:
                 )
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
-            ) and cfg.save_ply:
+            ) and cfg.save_ply and export_splats is not None:
 
                 if self.cfg.app_opt:
                     # eval at origin to bake the appeareance into the colors
@@ -816,6 +882,10 @@ class Runner:
                     format="ply",
                     save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
                 )
+            elif (
+                step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
+            ) and cfg.save_ply and export_splats is None:
+                print("export_splats not available in this gsplat build; skipping PLY export")
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:

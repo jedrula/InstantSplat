@@ -1,5 +1,6 @@
 import json
 import os
+import struct
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -96,6 +97,174 @@ from .normalize import (
 )
 
 
+def _qvec_to_rotmat(qvec: np.ndarray) -> np.ndarray:
+    """Convert COLMAP qvec [qw, qx, qy, qz] to rotation matrix."""
+    qw, qx, qy, qz = qvec
+    return np.array(
+        [
+            [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
+            [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
+            [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)],
+        ],
+        dtype=np.float64,
+    )
+
+
+class _FastCamera:
+    """Minimal camera object compatible with parser expectations."""
+
+    def __init__(self, camera_id: int, model_id: int, width: int, height: int, params: np.ndarray):
+        self.camera_id = camera_id
+        self.camera_type = model_id
+        self.width = width
+        self.height = height
+
+        # Defaults for non-distorted and unknown models.
+        self.fx = self.fy = float(params[0]) if len(params) > 0 else 1.0
+        self.cx = float(params[1]) if len(params) > 1 else width / 2.0
+        self.cy = float(params[2]) if len(params) > 2 else height / 2.0
+        self.k1 = self.k2 = self.k3 = self.k4 = self.p1 = self.p2 = 0.0
+
+        # Match the camera model handling used in this parser.
+        if model_id in (0, 2, 3):  # SIMPLE_PINHOLE, SIMPLE_RADIAL, RADIAL
+            self.fx = self.fy = float(params[0])
+            self.cx = float(params[1])
+            self.cy = float(params[2])
+            if len(params) > 3:
+                self.k1 = float(params[3])
+            if len(params) > 4:
+                self.k2 = float(params[4])
+        elif model_id in (1, 4, 5):  # PINHOLE, OPENCV, OPENCV_FISHEYE
+            self.fx = float(params[0])
+            self.fy = float(params[1])
+            self.cx = float(params[2])
+            self.cy = float(params[3])
+            if len(params) > 4:
+                self.k1 = float(params[4])
+            if len(params) > 5:
+                self.k2 = float(params[5])
+            if model_id == 4 and len(params) > 7:
+                self.p1 = float(params[6])
+                self.p2 = float(params[7])
+            if model_id == 5:
+                if len(params) > 6:
+                    self.k3 = float(params[6])
+                if len(params) > 7:
+                    self.k4 = float(params[7])
+
+
+class _FastImage:
+    """Minimal image object compatible with parser expectations."""
+
+    def __init__(self, image_id: int, qvec: np.ndarray, tvec: np.ndarray, camera_id: int, name: str):
+        self.image_id = image_id
+        self.qvec = qvec
+        self.tvec = tvec
+        self.camera_id = camera_id
+        self.name = name
+
+    def R(self):
+        return _qvec_to_rotmat(self.qvec)
+
+
+def _load_colmap_cameras_images_fast(colmap_dir: str):
+    """Load only cameras and images from COLMAP binaries, skipping point tracks."""
+    cameras_bin = os.path.join(colmap_dir, "cameras.bin")
+    images_bin = os.path.join(colmap_dir, "images.bin")
+    if not os.path.exists(cameras_bin) or not os.path.exists(images_bin):
+        raise FileNotFoundError("fast_init requires cameras.bin and images.bin")
+
+    camera_model_num_params = {
+        0: 3,  # SIMPLE_PINHOLE
+        1: 4,  # PINHOLE
+        2: 4,  # SIMPLE_RADIAL
+        3: 5,  # RADIAL
+        4: 8,  # OPENCV
+        5: 8,  # OPENCV_FISHEYE
+        6: 12, 7: 5, 8: 4, 9: 5, 10: 12, 11: 12,
+    }
+
+    cameras = {}
+    with open(cameras_bin, "rb") as f:
+        num_cameras = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(num_cameras):
+            camera_id = struct.unpack("<I", f.read(4))[0]
+            model_id = struct.unpack("<i", f.read(4))[0]
+            width = struct.unpack("<Q", f.read(8))[0]
+            height = struct.unpack("<Q", f.read(8))[0]
+            n_params = camera_model_num_params.get(model_id, 4)
+            params = np.array(struct.unpack(f"<{n_params}d", f.read(8 * n_params)))
+            cameras[camera_id] = _FastCamera(camera_id, model_id, width, height, params)
+
+    images = {}
+    with open(images_bin, "rb") as f:
+        num_images = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(num_images):
+            image_id = struct.unpack("<I", f.read(4))[0]
+            qvec = np.array(struct.unpack("<4d", f.read(32)), dtype=np.float64)
+            tvec = np.array(struct.unpack("<3d", f.read(24)), dtype=np.float64)
+            camera_id = struct.unpack("<I", f.read(4))[0]
+
+            name_bytes = bytearray()
+            while True:
+                c = f.read(1)
+                if c == b"\x00":
+                    break
+                name_bytes.extend(c)
+            name = name_bytes.decode("utf-8", errors="replace")
+
+            n_points2d = struct.unpack("<Q", f.read(8))[0]
+            # Skip x(double), y(double), point3D_id(int64) per point.
+            f.seek(n_points2d * 24, os.SEEK_CUR)
+
+            images[image_id] = _FastImage(image_id, qvec, tvec, camera_id, name)
+
+    return cameras, images
+
+
+def _load_colmap_points_fast(colmap_dir: str):
+    """Load COLMAP sparse points from points3D.bin while skipping tracks."""
+    points_bin = os.path.join(colmap_dir, "points3D.bin")
+    if not os.path.exists(points_bin):
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.uint8),
+        )
+
+    points = []
+    points_err = []
+    points_rgb = []
+    with open(points_bin, "rb") as f:
+        num_points = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(num_points):
+            # point3D_id
+            _ = struct.unpack("<Q", f.read(8))[0]
+            xyz = struct.unpack("<3d", f.read(24))
+            rgb = struct.unpack("<3B", f.read(3))
+            error = struct.unpack("<d", f.read(8))[0]
+            track_len = struct.unpack("<Q", f.read(8))[0]
+            # Skip track elements: (image_id:int32, point2D_idx:int32)
+            f.seek(track_len * 8, os.SEEK_CUR)
+
+            points.append(xyz)
+            points_rgb.append(rgb)
+            points_err.append(error)
+
+    if not points:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.uint8),
+        )
+
+    return (
+        np.asarray(points, dtype=np.float32),
+        np.asarray(points_err, dtype=np.float32),
+        np.asarray(points_rgb, dtype=np.uint8),
+    )
+
+
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
     paths = []
@@ -139,11 +308,14 @@ class Parser:
         factor: int = 1,
         normalize: bool = False,
         test_every: int = 8,
+        fast_init: bool = False,
+        mask_dir: Optional[str] = None,
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
+        self.mask_dir = mask_dir
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -152,13 +324,17 @@ class Parser:
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
 
-        manager = SceneManager(colmap_dir)
-        manager.load_cameras()
-        manager.load_images()
-        manager.load_points3D()
+        if fast_init:
+            cameras_fast, images_fast = _load_colmap_cameras_images_fast(colmap_dir)
+            imdata = images_fast
+        else:
+            manager = SceneManager(colmap_dir)
+            manager.load_cameras()
+            manager.load_images()
+            manager.load_points3D()
+            imdata = manager.images
 
         # Extract extrinsic matrices in world-to-camera format.
-        imdata = manager.images
         w2c_mats = []
         camera_ids = []
         Ks_dict = dict()
@@ -178,7 +354,7 @@ class Parser:
             camera_ids.append(camera_id)
 
             # camera intrinsics
-            cam = manager.cameras[camera_id]
+            cam = cameras_fast[camera_id] if fast_init else manager.cameras[camera_id]
             fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
             K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
             K[:2, :] /= factor
@@ -276,20 +452,24 @@ class Parser:
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
         # 3D points and {image_name -> [point_idx]}
-        points = manager.points3D.astype(np.float32)
-        points_err = manager.point3D_errors.astype(np.float32)
-        points_rgb = manager.point3D_colors.astype(np.uint8)
-        point_indices = dict()
+        if fast_init:
+            points, points_err, points_rgb = _load_colmap_points_fast(colmap_dir)
+            point_indices = {}
+        else:
+            points = manager.points3D.astype(np.float32)
+            points_err = manager.point3D_errors.astype(np.float32)
+            points_rgb = manager.point3D_colors.astype(np.uint8)
+            point_indices = dict()
 
-        image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
-        for point_id, data in manager.point3D_id_to_images.items():
-            for image_id, _ in data:
-                image_name = image_id_to_name[image_id]
-                point_idx = manager.point3D_id_to_point3D_idx[point_id]
-                point_indices.setdefault(image_name, []).append(point_idx)
-        point_indices = {
-            k: np.array(v).astype(np.int32) for k, v in point_indices.items()
-        }
+            image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
+            for point_id, data in manager.point3D_id_to_images.items():
+                for image_id, _ in data:
+                    image_name = image_id_to_name[image_id]
+                    point_idx = manager.point3D_id_to_point3D_idx[point_id]
+                    point_indices.setdefault(image_name, []).append(point_idx)
+            point_indices = {
+                k: np.array(v).astype(np.int32) for k, v in point_indices.items()
+            }
 
         # Normalize the world space.
         if normalize:
@@ -297,16 +477,21 @@ class Parser:
             camtoworlds = transform_cameras(T1, camtoworlds)
             points = transform_points(T1, points)
 
-            T2 = align_principal_axes(points)
-            camtoworlds = transform_cameras(T2, camtoworlds)
-            points = transform_points(T2, points)
+            # Fast smoke mode can skip COLMAP points entirely. In that case,
+            # keep camera-based normalization only and avoid point-based PCA.
+            if points.shape[0] >= 3:
+                T2 = align_principal_axes(points)
+                camtoworlds = transform_cameras(T2, camtoworlds)
+                points = transform_points(T2, points)
+            else:
+                T2 = np.eye(4)
 
             transform = T2 @ T1
 
             # Fix for up side down. We assume more points towards
             # the bottom of the scene which is true when ground floor is
             # present in the images.
-            if np.median(points[:, 2]) > np.mean(points[:, 2]):
+            if points.shape[0] > 0 and np.median(points[:, 2]) > np.mean(points[:, 2]):
                 # rotate 180 degrees around x axis such that z is flipped
                 T3 = np.array(
                     [
@@ -329,7 +514,23 @@ class Parser:
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
         self.params_dict = params_dict  # Dict of camera_id -> params
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
-        self.mask_dict = mask_dict  # Dict of camera_id -> mask
+        self.mask_dict = mask_dict  # Dict of camera_id -> mask (fisheye ROI only)
+
+        # Per-image masks loaded from mask_dir (e.g. DA3-refined wall masks).
+        if mask_dir is not None:
+            self.image_masks = []
+            for name in image_names:
+                p = os.path.join(mask_dir, name)
+                if os.path.exists(p):
+                    self.image_masks.append(
+                        imageio.imread(p).astype(bool)
+                    )
+                else:
+                    self.image_masks.append(None)
+            n_loaded = sum(m is not None for m in self.image_masks)
+            print(f"[Parser] Loaded {n_loaded}/{len(image_names)} masks from {mask_dir}")
+        else:
+            self.image_masks = [None] * len(image_names)
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
@@ -457,6 +658,8 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
 
+        image_mask = self.parser.image_masks[index]
+
         if len(params) > 0:
             # Images are distorted. Undistort them.
             mapx, mapy = (
@@ -466,6 +669,12 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+            # Apply the same remap+crop to the per-image mask so shapes match.
+            if image_mask is not None:
+                image_mask = cv2.remap(
+                    image_mask.astype(np.uint8), mapx, mapy, cv2.INTER_NEAREST
+                ).astype(bool)
+                image_mask = image_mask[y : y + h, x : x + w]
 
         if self.patch_size is not None:
             # Random crop.
@@ -482,7 +691,10 @@ class Dataset:
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
         }
-        if mask is not None:
+        # Per-image mask (DA3 or similar) takes priority; fall back to camera-level ROI mask.
+        if image_mask is not None:
+            data["mask"] = torch.from_numpy(image_mask).bool()
+        elif mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 
         if self.load_depths:

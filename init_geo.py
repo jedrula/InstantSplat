@@ -41,7 +41,7 @@ def _compute_sim_matrix(model, images, device):
 def main(source_path, model_path, ckpt_path, device, batch_size, image_size, schedule, lr, niter,
          min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False,
          focal_avg=False, infer_video=False, max_init_points=None, sparse_pairs=False,
-         use_sparse_ga=False):
+         use_sparse_ga=False, no_point_cap=False):
 
     # ---------------- (1) Load model and images ----------------
     save_path, sparse_0_path, sparse_1_path = init_filestructure(Path(source_path), n_views)
@@ -60,10 +60,11 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
     do_sparse_ga = use_sparse_ga
     print(f'>> Aligner: {"SparseGA" if do_sparse_ga else "PointCloudOptimizer"} ({len(images)} frames)')
 
-    # Auto-cap init points for SparseGA to avoid 3DGS training OOM
-    if do_sparse_ga and max_init_points is None:
+    # Auto-cap init points for SparseGA to avoid 3DGS training OOM on 8GB GPUs.
+    # Pass --no-point-cap on machines with ample VRAM (e.g. vast.ai 24GB+).
+    if do_sparse_ga and max_init_points is None and not no_point_cap:
         max_init_points = 1_500_000
-        print(f'>> Auto-capping max_init_points to {max_init_points:,} (SparseGA mode)')
+        print(f'>> Auto-capping max_init_points to {max_init_points:,} (SparseGA mode, use --no-point-cap to disable)')
 
     start_time = time()
     print(f'>> Making pairs...')
@@ -241,10 +242,12 @@ if __name__ == "__main__":
                         help='Use sparse FPS retrieval pairing instead of complete graph')
     parser.add_argument('--sparse_ga', action='store_true',
                         help='Use SparseGA aligner (memory-bounded, scales to many frames)')
+    parser.add_argument('--no_point_cap', action='store_true',
+                        help='Disable 1.5M point auto-cap (safe on 24GB+ GPUs, e.g. vast.ai)')
 
     args = parser.parse_args()
     main(args.source_path, args.model_path, args.ckpt_path, args.device, args.batch_size, args.image_size,
          args.schedule, args.lr, args.niter, args.min_conf_thr, args.llffhold, args.n_views,
          args.co_vis_dsp, args.depth_thre, args.conf_aware_ranking, args.focal_avg, args.infer_video,
          args.max_init_points, args.sparse_pairs,
-         use_sparse_ga=args.sparse_ga)
+         use_sparse_ga=args.sparse_ga, no_point_cap=args.no_point_cap)

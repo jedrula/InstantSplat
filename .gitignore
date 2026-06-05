@@ -12,5 +12,8 @@ diff_rasterization/dist
 
 # Scene data and outputs (large, regeneratable)
 assets/examples/
+assets/*.bin
 output_infer/
 output_glomap/
+demo_outputs/
+dust3r_visloc/
