@@ -1,0 +1,9 @@
+<Configuration id="{2D5793BC-A65D-4318-A1B9-A05044608385}">
+  <entry key="calexFileFormat" value="COLMAP"/>
+  <entry key="calexFileFormatId" value="{280B11A4-F9A3-47D1-AE58-C0DEA33487D8}"/>
+  <entry key="calexHasDisabled" value="0x0"/>
+  <entry key="calexHasUndistort" value="-1"/>
+  <entry key="calexHasImageExport" value="0"/>
+  <entry key="hasCalexFilePath" value="1"/>
+  <entry key="hasCalexFileName" value="1"/>
+</Configuration>

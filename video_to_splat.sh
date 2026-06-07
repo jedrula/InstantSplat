@@ -33,6 +33,7 @@ set -eo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 # Override INSTANTSPLAT_PYTHON env var for non-default conda locations
 PYTHON="${INSTANTSPLAT_PYTHON:-${HOME}/miniconda3/envs/instantsplat/bin/python}"
+CONDA_BIN="$(dirname "$PYTHON")"
 
 # ── Arg parsing ──────────────────────────────────────────────────────────────
 ITERS=""
@@ -44,7 +45,7 @@ SMART_FRAMES=0
 SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
-SFM="mast3r"       # mast3r | fast3r | colmap
+SFM="mast3r"       # mast3r | fast3r | colmap | glomap | glomap_lg | glomap_disk | glomap_sp | glomap_loftr | colmap_lg | fastmap | realityscan
 TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat
 COLMAP_BA=0
 COLMAP_MATCHER=""
@@ -79,10 +80,18 @@ while [[ $# -gt 0 ]]; do
         --trainer)          TRAINER="$2";        shift 2 ;;
         --engine)           # deprecated: map to --sfm + --trainer
             case "$2" in
-                pgsr)   SFM="mast3r";  TRAINER="pgsr" ;;
-                fast3r) SFM="fast3r";  TRAINER="instantsplat" ;;
-                colmap) SFM="colmap";  TRAINER="instantsplat" ;;
-                *)      SFM="mast3r";  TRAINER="instantsplat" ;;
+                pgsr)    SFM="mast3r";  TRAINER="pgsr" ;;
+                fast3r)  SFM="fast3r";  TRAINER="instantsplat" ;;
+                colmap)  SFM="colmap";  TRAINER="instantsplat" ;;
+                glomap)  SFM="glomap";  TRAINER="instantsplat" ;;
+                glomap_lg)    SFM="glomap_lg";    TRAINER="instantsplat" ;;
+                glomap_disk)  SFM="glomap_disk";  TRAINER="instantsplat" ;;
+                glomap_sp)    SFM="glomap_sp";    TRAINER="instantsplat" ;;
+                glomap_loftr) SFM="glomap_loftr"; TRAINER="instantsplat" ;;
+                colmap_lg)    SFM="colmap_lg";    TRAINER="instantsplat" ;;
+                fastmap)      SFM="fastmap";      TRAINER="instantsplat" ;;
+                realityscan)  SFM="realityscan"; TRAINER="instantsplat" ;;
+                *)            SFM="mast3r";      TRAINER="instantsplat" ;;
             esac
             shift 2 ;;
         --colmap-ba)        COLMAP_BA=1;         shift ;;
@@ -364,6 +373,425 @@ elif [[ "$SFM" == "colmap" ]]; then
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01e_colmap_convert.log"
+elif [[ "$SFM" == "glomap" ]]; then
+    echo "[2/3] COLMAP features + matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
+    DB_PATH="$SCENE_DIR/database.db"
+    SPARSE_PARENT="$SCENE_DIR/sparse"
+    rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
+    rm -f "$DB_PATH"
+    export QT_QPA_PLATFORM=offscreen
+
+    # GLOMAP is deprecated upstream; its global mapper is now part of COLMAP 4.x.
+    # Use $CONDA_BIN/colmap throughout so features, matching, and global_mapper
+    # all share the same DB schema — no version mismatch, retriangulation works.
+    "$CONDA_BIN/colmap" feature_extractor \
+        --database_path "$DB_PATH" \
+        --image_path "$IMAGE_DIR" \
+        --ImageReader.camera_model PINHOLE \
+        --ImageReader.single_camera 1 \
+        --FeatureExtraction.use_gpu 1 \
+        2>&1 | tee "$MODEL_DIR/01a_glomap_features.log"
+
+    _MATCHER="${COLMAP_MATCHER}"
+    if [[ -z "$_MATCHER" ]]; then
+        (( TOTAL_FRAMES <= 50 )) && _MATCHER="exhaustive" || _MATCHER="sequential"
+    fi
+    echo "    Matcher: $_MATCHER"
+    if [[ "$_MATCHER" == "exhaustive" ]]; then
+        "$CONDA_BIN/colmap" exhaustive_matcher \
+            --database_path "$DB_PATH" \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$MODEL_DIR/01b_glomap_match.log"
+    elif [[ "$_MATCHER" == "vocab_tree" ]]; then
+        # COLMAP 4.x uses faiss (not flann) — needs the faiss-format tree
+        VOCAB_TREE="$REPO/assets/vocab_tree_faiss_flickr100K_words256K.bin"
+        if [[ ! -f "$VOCAB_TREE" ]]; then
+            echo "Error: vocab tree not found at $VOCAB_TREE"
+            echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
+            exit 1
+        fi
+        "$CONDA_BIN/colmap" vocab_tree_matcher \
+            --database_path "$DB_PATH" \
+            --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$MODEL_DIR/01b_glomap_match.log"
+    else
+        "$CONDA_BIN/colmap" sequential_matcher \
+            --database_path "$DB_PATH" \
+            --SequentialMatching.overlap 10 \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$MODEL_DIR/01b_glomap_match.log"
+    fi
+
+    "$CONDA_BIN/colmap" global_mapper \
+        --database_path "$DB_PATH" \
+        --image_path "$IMAGE_DIR" \
+        --output_path "$SPARSE_PARENT" \
+        2>&1 | tee "$MODEL_DIR/01c_glomap_sfm.log"
+
+    if [[ ! -d "$SPARSE_PARENT/0" ]]; then
+        echo "Error: GLOMAP produced no reconstruction. Check $MODEL_DIR/01c_glomap_sfm.log"
+        exit 1
+    fi
+
+    SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
+        "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_glomap_filter.log"
+
+    "$CONDA_BIN/colmap" model_converter \
+        --input_path "$SPARSE_PARENT/0" \
+        --output_path "$SPARSE_PARENT/0" \
+        --output_type TXT \
+        2>&1 | tee "$MODEL_DIR/01e_glomap_convert.log"
+elif [[ "$SFM" == "glomap_lg" ]]; then
+    echo "[2/3] ALIKED+LightGlue features + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
+    SPARSE_PARENT="$SCENE_DIR/sparse"
+    rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
+    HLOC_WORK="$SCENE_DIR/hloc_work"
+    rm -rf "$HLOC_WORK"
+
+    CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/glomap_hloc.py" \
+        "$IMAGE_DIR" \
+        "$HLOC_WORK" \
+        --matcher aliked+lightglue \
+        --colmap-bin "$CONDA_BIN/colmap" \
+        2>&1 | tee "$MODEL_DIR/01_glomap_lg.log"
+
+    if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
+        echo "Error: glomap_hloc produced no reconstruction. Check $MODEL_DIR/01_glomap_lg.log"
+        exit 1
+    fi
+
+    mv "$HLOC_WORK/sparse/0" "$SPARSE_PARENT/0"
+
+    SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
+        "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_lg_filter.log"
+
+    "$CONDA_BIN/colmap" model_converter \
+        --input_path "$SPARSE_PARENT/0" \
+        --output_path "$SPARSE_PARENT/0" \
+        --output_type TXT \
+        2>&1 | tee "$MODEL_DIR/01c_glomap_lg_convert.log"
+elif [[ "$SFM" == "glomap_loftr" ]]; then
+    echo "[2/3] LoFTR semi-dense matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
+    SPARSE_PARENT="$SCENE_DIR/sparse"
+    rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
+    HLOC_WORK="$SCENE_DIR/hloc_work"
+    rm -rf "$HLOC_WORK"
+
+    CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/glomap_hloc.py" \
+        "$IMAGE_DIR" \
+        "$HLOC_WORK" \
+        --matcher loftr_indoor \
+        --colmap-bin "$CONDA_BIN/colmap" \
+        2>&1 | tee "$MODEL_DIR/01_glomap_loftr.log"
+
+    if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
+        echo "Error: glomap_hloc (loftr) produced no reconstruction. Check $MODEL_DIR/01_glomap_loftr.log"
+        exit 1
+    fi
+
+    mv "$HLOC_WORK/sparse/0" "$SPARSE_PARENT/0"
+
+    SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
+        "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_loftr_filter.log"
+
+    "$CONDA_BIN/colmap" model_converter \
+        --input_path "$SPARSE_PARENT/0" \
+        --output_path "$SPARSE_PARENT/0" \
+        --output_type TXT \
+        2>&1 | tee "$MODEL_DIR/01c_glomap_loftr_convert.log"
+elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || "$SFM" == "colmap_lg" ]]; then
+    case "$SFM" in
+        glomap_disk) _MATCHER="disk+lightglue";       _MAPPER="glomap" ;;
+        glomap_sp)   _MATCHER="superpoint+lightglue"; _MAPPER="glomap" ;;
+        colmap_lg)   _MATCHER="aliked+lightglue";     _MAPPER="colmap" ;;
+    esac
+    echo "[2/3] hloc($_MATCHER) + $_MAPPER SfM ($TOTAL_FRAMES frames)..."
+    SPARSE_PARENT="$SCENE_DIR/sparse"
+    rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
+    HLOC_WORK="$SCENE_DIR/hloc_work"
+    rm -rf "$HLOC_WORK"
+
+    # Focal length prior from previous reconstruction if available (fixes GLOMAP warning)
+    _FL_ARG=""
+    _PREV_TF=$(find "$SCENE_DIR" -name "transforms.json" 2>/dev/null | head -1)
+    if [[ -n "$_PREV_TF" ]]; then
+        _FL=$(python3 -c "import json; d=json.load(open('$_PREV_TF')); print(d.get('fl_x',''))" 2>/dev/null || true)
+        [[ -n "$_FL" ]] && _FL_ARG="--focal-length $_FL"
+    fi
+
+    CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/glomap_hloc.py" \
+        "$IMAGE_DIR" \
+        "$HLOC_WORK" \
+        --matcher "$_MATCHER" \
+        --mapper "$_MAPPER" \
+        $_FL_ARG \
+        --colmap-bin "$CONDA_BIN/colmap" \
+        2>&1 | tee "$MODEL_DIR/01_${SFM}.log"
+
+    if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
+        echo "Error: hloc SfM produced no reconstruction. Check $MODEL_DIR/01_${SFM}.log"
+        exit 1
+    fi
+
+    mv "$HLOC_WORK/sparse/0" "$SPARSE_PARENT/0"
+
+    SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
+        "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_${SFM}_filter.log"
+
+    "$CONDA_BIN/colmap" model_converter \
+        --input_path "$SPARSE_PARENT/0" \
+        --output_path "$SPARSE_PARENT/0" \
+        --output_type TXT \
+        2>&1 | tee "$MODEL_DIR/01c_${SFM}_convert.log"
+elif [[ "$SFM" == "fastmap" ]]; then
+    echo "[2/3] COLMAP features + matching + FastMap pose estimation ($TOTAL_FRAMES frames)..."
+    DB_PATH="$SCENE_DIR/database.db"
+    SPARSE_PARENT="$SCENE_DIR/sparse"
+    FM_OUTPUT="$SCENE_DIR/fastmap_out"
+    rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
+    rm -f "$DB_PATH"
+    rm -rf "$FM_OUTPUT"
+    export QT_QPA_PLATFORM=offscreen
+
+    "$CONDA_BIN/colmap" feature_extractor \
+        --database_path "$DB_PATH" \
+        --image_path "$IMAGE_DIR" \
+        --ImageReader.camera_model PINHOLE \
+        --ImageReader.single_camera 1 \
+        --FeatureExtraction.use_gpu 1 \
+        2>&1 | tee "$MODEL_DIR/01a_fastmap_features.log"
+
+    _MATCHER="${COLMAP_MATCHER}"
+    if [[ -z "$_MATCHER" ]]; then
+        (( TOTAL_FRAMES <= 50 )) && _MATCHER="exhaustive" || _MATCHER="sequential"
+    fi
+    echo "    Matcher: $_MATCHER"
+    if [[ "$_MATCHER" == "exhaustive" ]]; then
+        "$CONDA_BIN/colmap" exhaustive_matcher \
+            --database_path "$DB_PATH" \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$MODEL_DIR/01b_fastmap_match.log"
+    elif [[ "$_MATCHER" == "vocab_tree" ]]; then
+        VOCAB_TREE="$REPO/assets/vocab_tree_faiss_flickr100K_words256K.bin"
+        if [[ ! -f "$VOCAB_TREE" ]]; then
+            echo "Error: vocab tree not found at $VOCAB_TREE"
+            echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
+            exit 1
+        fi
+        "$CONDA_BIN/colmap" vocab_tree_matcher \
+            --database_path "$DB_PATH" \
+            --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$MODEL_DIR/01b_fastmap_match.log"
+    else
+        "$CONDA_BIN/colmap" sequential_matcher \
+            --database_path "$DB_PATH" \
+            --SequentialMatching.overlap 10 \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$MODEL_DIR/01b_fastmap_match.log"
+    fi
+
+    FASTMAP_DIR="${FASTMAP_DIR:-/home/communications/workdir/fastmap}"
+    CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$FASTMAP_DIR/run.py" \
+        --database "$DB_PATH" \
+        --image_dir "$IMAGE_DIR" \
+        --output_dir "$FM_OUTPUT" \
+        --pinhole \
+        --headless \
+        2>&1 | tee "$MODEL_DIR/01c_fastmap_sfm.log"
+
+    if [[ ! -d "$FM_OUTPUT/sparse/0" ]]; then
+        echo "Error: FastMap produced no reconstruction. Check $MODEL_DIR/01c_fastmap_sfm.log"
+        exit 1
+    fi
+
+    mv "$FM_OUTPUT/sparse/0" "$SPARSE_PARENT/0"
+
+    SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
+        "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_fastmap_filter.log"
+
+    /usr/bin/colmap model_converter \
+        --input_path "$SPARSE_PARENT/0" \
+        --output_path "$SPARSE_PARENT/0" \
+        --output_type TXT \
+        2>&1 | tee "$MODEL_DIR/01e_fastmap_convert.log"
+elif [[ "$SFM" == "realityscan" ]]; then
+    echo "[2/3] RealityScan alignment + COLMAP export ($TOTAL_FRAMES frames)..."
+    # RealityScan always needs an X display even with -stdConsole; xvfb-run -a
+    # spins up a throwaway virtual display (forum: unrealengine.com
+    # /t/realityscan-fully-headless-linux/2682217).
+    # Must call wine directly with --cx-app (CreateProcessW) rather than via
+    # realityscan-cli, which uses ShellExecuteExW and concatenates exe+args
+    # into lpFile causing "cannot execute" error.
+    # Z: drive maps to Linux root (/).
+    RS_WINE="${REALITYSCAN_WINE:-/opt/realityscan/bin/wine}"
+    RS_EXE="C:/Program Files/Epic Games/RealityScan/RealityScan.exe"
+    RS_OUT="$SCENE_DIR/rs_output"
+    SPARSE_PARENT="$SCENE_DIR/sparse"
+
+    if [[ ! -x "$RS_WINE" ]]; then
+        echo "Error: RealityScan wine launcher not found at $RS_WINE"
+        echo "  Install: sudo apt install ~/Downloads/RealityScan-*.deb"
+        echo "  Or set:  REALITYSCAN_WINE=/opt/realityscan/bin/wine"
+        exit 1
+    fi
+    if ! command -v xvfb-run &>/dev/null; then
+        echo "Error: xvfb-run not found — install it: sudo apt install xvfb"
+        exit 1
+    fi
+
+    rm -rf "$RS_OUT" "$SPARSE_PARENT"
+    mkdir -p "$RS_OUT" "$SPARSE_PARENT/0"
+
+    # RealityScan (Wine) cannot decode progressive JPEGs — re-encode them as baseline in-place.
+    # SOF2 marker (0xFFC2) = progressive; SOF0 (0xFFC0) = baseline.
+    python3 - "$IMAGE_DIR" <<'PYEOF'
+import sys, os
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+img_dir = sys.argv[1]
+for fname in os.listdir(img_dir):
+    if not fname.lower().endswith(('.jpg', '.jpeg')):
+        continue
+    path = os.path.join(img_dir, fname)
+    with open(path, 'rb') as f:
+        data = f.read(65536)
+    if b'\xff\xc2' in data:  # SOF2 = progressive JPEG
+        print(f"    ⚠  re-encoding progressive JPEG: {fname}")
+        im = Image.open(path).convert('RGB')
+        im.save(path, 'JPEG', quality=95, progressive=False, optimize=False)
+PYEOF
+
+    # rs_colmap_params.xml  → COLMAP writer (images.txt + points3D.txt, undistorted images)
+    # rs_csv_params.xml     → CSV intrinsics export (needed to synthesise cameras.txt)
+    RS_PARAMS="Z:${REPO}/rs_colmap_params.xml"
+    RS_CSV_PARAMS="Z:${REPO}/rs_csv_params.xml"
+
+    # COLMAP writer puts output in RS_OUT/sparse/0/  (COLMAP standard layout).
+    # CSV writer puts intrinsics in RS_OUT/intrinsics.csv.
+    # 300 s timeout: RS should finish alignment in < 2 min; a hang means Epic auth
+    # failed (expired session). Kill-on-timeout lets the pipeline fail fast.
+    RS_TIMEOUT="${REALITYSCAN_TIMEOUT:-300}"
+    timeout "$RS_TIMEOUT" xvfb-run -a "$RS_WINE" \
+        --bottle=default \
+        --cx-app "$RS_EXE" \
+        -- \
+        -stdConsole \
+        -set appIgnoreExifGPS=true \
+        -set sfmEnableCameraPrior=false \
+        -addFolder "Z:${IMAGE_DIR}" \
+        -align \
+        -selectMaximalComponent \
+        -exportRegistration "Z:${RS_OUT}/cameras.txt" "$RS_PARAMS" \
+        -exportRegistration "Z:${RS_OUT}/intrinsics.csv" "$RS_CSV_PARAMS" \
+        -exportSparsePointCloud "Z:${RS_OUT}/points3D.ply" \
+        -quit \
+        2>&1 | tee "$MODEL_DIR/01a_rs_align.log" \
+    || { ec=$?; [[ $ec -eq 124 ]] && echo "Error: RealityScan timed out after ${RS_TIMEOUT}s — Epic session may have expired; re-login on the physical machine and retry" || echo "Error: RealityScan exited with code $ec"; exit $ec; }
+
+    # COLMAP writer outputs to RS_OUT/sparse/0/ (standard) or RS_OUT/ (flat).
+    RS_COLMAP_DIR="$RS_OUT/sparse/0"
+    [[ ! -f "$RS_COLMAP_DIR/images.txt" ]] && RS_COLMAP_DIR="$RS_OUT"
+
+    if [[ ! -f "$RS_COLMAP_DIR/images.txt" ]]; then
+        echo "Error: RealityScan produced no images.txt. Check $MODEL_DIR/01a_rs_align.log"
+        exit 1
+    fi
+
+    # Move images.txt + points3D.txt (cameras.txt is synthesised below).
+    for _f in images.txt points3D.txt; do
+        [[ -f "$RS_COLMAP_DIR/$_f" ]] && mv "$RS_COLMAP_DIR/$_f" "$SPARSE_PARENT/0/"
+    done
+
+    # Synthesise cameras.txt from CSV intrinsics + images.txt.
+    RS_UNDIST_DIR="$RS_OUT/images"
+    "$PYTHON" "$REPO/rs_make_cameras_txt.py" \
+        "$SPARSE_PARENT/0/images.txt" \
+        "$RS_OUT/intrinsics.csv" \
+        "$RS_UNDIST_DIR" \
+        "$SPARSE_PARENT/0/cameras.txt" \
+        2>&1 | tee -a "$MODEL_DIR/01a_rs_align.log"
+
+    if [[ ! -f "$SPARSE_PARENT/0/cameras.txt" ]]; then
+        echo "Error: rs_make_cameras_txt.py failed. Check $MODEL_DIR/01a_rs_align.log"
+        exit 1
+    fi
+
+    # RS undistorted images are RGBA and vary in size per image (different undistortion crops).
+    # Normalise them to the canonical W×H in cameras.txt (RGB, consistent size) so trainers
+    # don't crash on dimension mismatches.
+    python3 - "$SPARSE_PARENT/0/cameras.txt" "$RS_UNDIST_DIR" <<'PYEOF'
+import sys, os
+from PIL import Image
+
+cam_file, img_dir = sys.argv[1], sys.argv[2]
+# Read first camera's width/height from cameras.txt
+W = H = None
+with open(cam_file) as f:
+    for line in f:
+        if line.startswith('#') or not line.strip():
+            continue
+        parts = line.split()
+        W, H = int(parts[2]), int(parts[3])
+        break
+if W is None:
+    print("  ⚠  could not read camera dims — skipping normalisation"); sys.exit(0)
+print(f"  normalising RS images → {W}×{H} RGB")
+for fname in os.listdir(img_dir):
+    if not fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+        continue
+    path = os.path.join(img_dir, fname)
+    im = Image.open(path).convert('RGB')
+    if im.size != (W, H):
+        im = im.resize((W, H), Image.LANCZOS)
+    im.save(path, 'PNG')
+print(f"  done")
+PYEOF
+
+    # Convert text reconstruction to binary so gsplat/pgsr/nerfstudio fast loaders work.
+    "$PYTHON" -c "
+import pycolmap
+from pathlib import Path
+p = Path('$SPARSE_PARENT/0')
+r = pycolmap.Reconstruction(str(p))
+r.write_binary(str(p))
+print(f'  → text→binary: {len(r.cameras)} cameras, {len(r.images)} images, {len(r.points3D)} points')
+" 2>&1 | tee -a "$MODEL_DIR/01a_rs_align.log"
+
+    # Use the undistorted images for training (camera models are for those images).
+    IMAGE_DIR="$RS_UNDIST_DIR"
+    TOTAL_FRAMES=$(find "$IMAGE_DIR" -maxdepth 1 \( -name "*.png" -o -name "*.jpg" \) | wc -l)
+
+    # If points3D is missing (registration-only export), synthesise it from the PLY
+    if [[ ! -f "$SPARSE_PARENT/0/points3D.bin" && ! -f "$SPARSE_PARENT/0/points3D.txt" ]]; then
+        if [[ -f "$RS_OUT/points3D.ply" ]]; then
+            "$PYTHON" "$REPO/rs_ply_to_points3d.py" \
+                "$RS_OUT/points3D.ply" \
+                "$SPARSE_PARENT/0/points3D.bin" \
+                2>&1 | tee -a "$MODEL_DIR/01a_rs_align.log"
+        else
+            # No points at all — write an empty points3D.txt so pycolmap can load
+            printf "# 3D point list\n# Number of points: 0\n" > "$SPARSE_PARENT/0/points3D.txt"
+            echo "    ⚠  No sparse points found — initialising with empty points3D"
+        fi
+    fi
+
+    SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
+        "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_rs_filter.log"
+
+    # Symlink surviving undistorted images into SCENE_DIR/images/ so trainers find
+    # them by their RS names (00000.png, 00001.png, …) via the standard data-dir layout.
+    # Run after filter so only non-outlier images get linked.
+    find "$RS_UNDIST_DIR" -maxdepth 1 \( -name "*.png" -o -name "*.jpg" \) | \
+        while read -r _img; do ln -sfn "$_img" "$SCENE_DIR/images/$(basename "$_img")"; done
+    IMAGE_DIR="$SCENE_DIR/images"
+
+    /usr/bin/colmap model_converter \
+        --input_path "$SPARSE_PARENT/0" \
+        --output_path "$SPARSE_PARENT/0" \
+        --output_type TXT \
+        2>&1 | tee "$MODEL_DIR/01c_rs_convert.log"
 else
     # Clear any cache left by a previous crashed run; stale SparseGA cache causes
     # device-side assert when tensor shapes no longer match the new image set.
@@ -387,6 +815,19 @@ else
         $INIT_GEO_ARGS \
         2>&1 | tee "$MODEL_DIR/01_init_geo.log"
 fi
+# Export sparse point cloud as PLY for browser preview
+if [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+    _PC_SRC="$SCENE_DIR/sparse/0"
+else
+    _PC_SRC="$SCENE_DIR/sparse_${TOTAL_FRAMES}/0"
+fi
+if [[ -d "$_PC_SRC" ]]; then
+    /usr/bin/colmap model_converter \
+        --input_path "$_PC_SRC" \
+        --output_path "$MODEL_DIR/sfm_pointcloud.ply" \
+        --output_type PLY 2>/dev/null || true
+fi
+
 SFM_END=$(date +%s)
 SFM_ELAPSED=$(( SFM_END - SFM_START ))
 SFM_MIN=$(awk "BEGIN {printf \"%.1f\", $SFM_ELAPSED / 60}")
@@ -419,9 +860,28 @@ if [[ "$TRAINER" == "splatfacto" ]]; then
     echo "[2/3] nerfstudio splatfacto training ($ITERS iterations, $TOTAL_FRAMES frames)..."
     NS_PROCESS_DIR="$MODEL_DIR/ns_input"
     NS_TRAIN_DIR="$MODEL_DIR/ns_train"
-    SPARSE_PARENT="$SCENE_DIR/sparse"
+    # MASt3R/Fast3R write sparse_N/0/; classical SfM writes sparse/0/
+    if [[ "$SFM" == "mast3r" || "$SFM" == "fast3r" ]]; then
+        SPARSE_PARENT="$SCENE_DIR/sparse_${TOTAL_FRAMES}"
+    else
+        SPARSE_PARENT="$SCENE_DIR/sparse"
+    fi
+    # MASt3R/Fast3R output points3D.ply — convert to points3D.bin for nerfstudio
+    if [[ "$SFM" == "mast3r" || "$SFM" == "fast3r" ]]; then
+        if [[ ! -f "$SPARSE_PARENT/0/points3D.bin" && -f "$SPARSE_PARENT/0/points3D.ply" ]]; then
+            "$PYTHON" "$REPO/rs_ply_to_points3d.py" \
+                "$SPARSE_PARENT/0/points3D.ply" \
+                "$SPARSE_PARENT/0/points3D.bin" \
+                2>&1 | tee -a "$MODEL_DIR/02a_ns_process.log"
+        fi
+    fi
+    # RS exports undistorted images; COLMAP poses are calibrated for those, not originals.
+    # Use undistorted images when present (realityscan SfM), else fall back to IMAGE_DIR.
+    NS_IMAGE_SRC="$IMAGE_DIR"
+    [[ "$SFM" == "realityscan" && -d "$SCENE_DIR/rs_output/images" ]] && \
+        NS_IMAGE_SRC="$SCENE_DIR/rs_output/images"
     ns-process-data images \
-        --data "$IMAGE_DIR" \
+        --data "$NS_IMAGE_SRC" \
         --output-dir "$NS_PROCESS_DIR" \
         --skip-colmap \
         --colmap-model-path "$SPARSE_PARENT/0" \
@@ -432,9 +892,19 @@ if [[ "$TRAINER" == "splatfacto" ]]; then
         --max-num-iterations "$ITERS" \
         --vis tensorboard \
         2>&1 | tee "$MODEL_DIR/02_train.log"
+    # Extract initial camera from training views for the splat viewer
+    [[ -f "$NS_PROCESS_DIR/transforms.json" ]] && \
+        python3 "$REPO/camera_from_colmap.py" \
+            --sparse   "$SPARSE_PARENT/0" \
+            --trainer  splatfacto \
+            --ns-process-dir "$NS_PROCESS_DIR" \
+            --ns-train-dir   "$NS_TRAIN_DIR" \
+            --splat    "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
+            --out      "$MODEL_DIR/initial_camera.json" \
+            2>/dev/null || true
 elif [[ "$TRAINER" == "pgsr" ]]; then
     # For mast3r/fast3r, symlink sparse → sparse_N so sparse/0/ exists.
-    [[ "$SFM" != "colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap" && "$SFM" != "glomap" && "$SFM" != "glomap_lg" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_sp" && "$SFM" != "colmap_lg" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     # PGSR looks for sparse/images.bin (no 0/ subdir) — symlink files up from sparse/0/
     for _f in cameras.txt images.txt points3D.txt cameras.bin images.bin points3D.bin; do
         [[ -f "$SCENE_DIR/sparse/0/$_f" ]] && \
@@ -451,12 +921,26 @@ elif [[ "$TRAINER" == "pgsr" ]]; then
         --save_iterations "$ITERS" \
         --test_iterations "$ITERS" \
         2>&1 | tee "$MODEL_DIR/02_train.log"
+    # Extract initial camera (no colmap_to_ply_transform.npy for pgsr yet — COLMAP world space)
+    python3 "$REPO/camera_from_colmap.py" \
+        --sparse     "$SPARSE_PARENT/0" \
+        --trainer    pgsr \
+        --result-dir "$MODEL_DIR" \
+        --splat      "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
+        --out        "$MODEL_DIR/initial_camera.json" \
+        2>/dev/null || true
 elif [[ "$TRAINER" == "gsplat" ]]; then
     # gsplat via InstantSplat/simple_trainer.py — already proven on this 8GB machine
-    [[ "$SFM" != "colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap" && "$SFM" != "glomap" && "$SFM" != "glomap_lg" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_sp" && "$SFM" != "colmap_lg" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames)..."
-    PYTHONPATH="$REPO/gsplat_examples" CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/simple_trainer.py" default \
+    # DefaultStrategy defaults are tuned for 30K iters (refine_stop=15K, reset_every=3K).
+    # When ITERS is shorter, densification runs through 100% of training → runaway
+    # Gaussian growth (2K→600K) → 15 dB PSNR instead of ~30 dB.
+    # Scale proportionally: stop densifying at ITERS/2, reset every ITERS/10.
+    _GS_REFINE_STOP=$(( ITERS / 2 ))
+    _GS_RESET_EVERY=$(( ITERS / 10 < 100 ? 100 : ITERS / 10 ))
+    PYTHONPATH="$REPO/gsplat_examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/simple_trainer.py" default \
         --data-dir "$SCENE_DIR" \
         --data-factor 1 \
         --result-dir "$GSPLAT_OUT" \
@@ -469,12 +953,27 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         --disable-viewer \
         --disable-video \
         --ssim-lambda 0.2 \
+        --strategy.refine-stop-iter "$_GS_REFINE_STOP" \
+        --strategy.reset-every "$_GS_RESET_EVERY" \
+        --strategy.absgrad \
+        --max-gs 500000 \
         2>&1 | tee "$MODEL_DIR/02_train.log"
+    # Extract initial camera (uses colmap_to_ply_transform.npy saved by simple_trainer.py)
+    python3 "$REPO/camera_from_colmap.py" \
+        --sparse     "$SPARSE_PARENT/0" \
+        --trainer    gsplat \
+        --result-dir "$GSPLAT_OUT" \
+        --splat      "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
+        --out        "$MODEL_DIR/initial_camera.json" \
+        2>/dev/null || true
 else
     # instantsplat trainer
+    # train.py looks for sparse_{N}/0/ — COLMAP/GLOMAP/FastMap write sparse/0/ instead;
+    # symlink sparse_N → sparse so the scene loader finds it.
+    [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && ln -sfn "sparse" "$SCENE_DIR/sparse_${TOTAL_FRAMES}" 2>/dev/null || true
     # --pp_optimizer requires confidence_dsp.npy from init_geo.py (MASt3R/Fast3R only)
     PP_OPT_ARG="--pp_optimizer"
-    [[ "$SFM" == "colmap" ]] && PP_OPT_ARG=""
+    [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && PP_OPT_ARG=""
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
         -s "$SCENE_DIR" \
         -m "$MODEL_DIR" \
@@ -486,6 +985,15 @@ else
         $TRAIN_ARGS \
         $EARLY_STOP_ARGS \
         2>&1 | tee "$MODEL_DIR/02_train.log"
+    # instantsplat trainer: no colmap_to_ply_transform.npy yet; use sparse/0 directly
+    # (output will be in COLMAP world space — still better than nothing)
+    python3 "$REPO/camera_from_colmap.py" \
+        --sparse     "$SPARSE_PARENT/0" \
+        --trainer    instantsplat \
+        --result-dir "$MODEL_DIR" \
+        --splat      "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
+        --out        "$MODEL_DIR/initial_camera.json" \
+        2>/dev/null || true
 fi
 
 echo "    → done"
@@ -500,7 +1008,8 @@ if grep -q 'Early stopping' "$MODEL_DIR/02_train.log" 2>/dev/null; then
     STOPPED_AT_ITER=$(grep -oP '\[ITER \K\d+(?=\] Early stopping)' "$MODEL_DIR/02_train.log" | tail -1)
     STOPPED_AT_ITER=${STOPPED_AT_ITER:-null}
 fi
-emit_event "{\"event\":\"train_done\",\"elapsed_s\":$TRAIN_ELAPSED,\"early_stopped\":$EARLY_STOPPED_FLAG,\"stopped_at_iter\":$STOPPED_AT_ITER}"
+METRICS_JSON=$("$PYTHON" "$REPO/extract_metrics.py" "$MODEL_DIR" "$SPARSE_PARENT/0" 2>/dev/null || echo "{}")
+emit_event "{\"event\":\"train_done\",\"elapsed_s\":$TRAIN_ELAPSED,\"early_stopped\":$EARLY_STOPPED_FLAG,\"stopped_at_iter\":$STOPPED_AT_ITER,\"metrics\":$METRICS_JSON}"
 
 # Resolve PLY path — differs by trainer
 if [[ "$TRAINER" == "gsplat" ]]; then

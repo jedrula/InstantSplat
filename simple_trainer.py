@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -134,6 +135,10 @@ class Config:
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
+    # Hard cap on Gaussian count for DefaultStrategy (0 = unlimited). Once the
+    # splat count exceeds this, densification is skipped for the rest of training.
+    # Prevents OOM on small GPUs when densification runs away.
+    max_gs: int = 0
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
     # Use sparse gradients for optimization. (experimental)
@@ -367,6 +372,14 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+
+        # Save the 4×4 COLMAP-world → training-space transform so that external tools
+        # (initial camera picker, query image localizer) can convert poses without
+        # re-running training. Shape (4,4), float64.
+        np.save(
+            os.path.join(cfg.result_dir, "colmap_to_ply_transform.npy"),
+            self.parser.transform.astype(np.float64),
+        )
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -663,7 +676,7 @@ class Runner:
 
         # Training loop.
         global_tic = time.time()
-        pbar = tqdm.tqdm(range(init_step, max_steps))
+        pbar = tqdm.tqdm(range(init_step, max_steps), disable=not sys.stderr.isatty())
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
@@ -793,6 +806,14 @@ class Runner:
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
+
+            if step > 0 and step % 500 == 0:
+                elapsed = time.time() - global_tic
+                print(
+                    f"[train] step {step}/{max_steps}  loss={loss.item():.4f}"
+                    f"  GS={len(self.splats['means'])}  t={elapsed:.0f}s",
+                    flush=True,
+                )
 
             # write images (gt and render)
             # if world_rank == 0 and step % 800 == 0:
@@ -933,14 +954,18 @@ class Runner:
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
+                n_gs = len(self.splats["means"])
+                if cfg.max_gs > 0 and n_gs >= cfg.max_gs:
+                    pass  # Gaussian cap reached; skip densification for this step
+                else:
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        packed=cfg.packed,
+                    )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,

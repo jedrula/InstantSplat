@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RealityScan params for: -exportRegistration <dir> rs_colmap_export.xml
+
+  Requests COLMAP binary export in standard directory layout (sparse/0/).
+  RealityScan 2.1.1+ supports binary COLMAP output natively.
+
+  TODO: Verify attribute names after first install.
+  Check example params files at:
+    /opt/realityscan/support/realityscan/drive_c/Program Files/Epic Games/RealityScan/
+  Or export once via the GUI to see what XML it writes.
+
+  If export produces unexpected format, try removing the params.xml argument
+  (exportRegistration will use the current application settings instead).
+-->
+<ExportRegistrationParams version="1">
+  <ExportRegistration
+    exportType="COLMAP"
+    binary="true"
+    colmapLayout="true"
+  />
+</ExportRegistrationParams>

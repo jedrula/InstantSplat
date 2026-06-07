@@ -1,0 +1,7 @@
+<Configuration id="{2D5793BC-A65D-4318-A1B9-A05044608385}">
+  <entry key="calexFileFormat" value="Internal/External Camera Parameters"/>
+  <entry key="calexFileFormatId" value="{0CA18733-1EBC-4254-9974-17197EB409BD}"/>
+  <entry key="calexHasDisabled" value="0x0"/>
+  <entry key="hasCalexFilePath" value="1"/>
+  <entry key="hasCalexFileName" value="1"/>
+</Configuration>

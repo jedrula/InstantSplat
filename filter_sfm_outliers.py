@@ -109,9 +109,24 @@ for line in p3d_lines:
         filtered_pts.append(' '.join(fixed + new_track) + '\n')
 points_txt.write_text(''.join(filtered_pts))
 
+# Drop rig/frame metadata — the TXT filter only touched images/points3D,
+# leaving frames.txt intact. Reading it back with missing images causes a
+# consistency check failure. Strip frames/rigs so pycolmap reads a plain model.
+for _f in ['frames.txt', 'rigs.txt']:
+    _p = txt_path / _f
+    if _p.exists():
+        _p.unlink()
+
 # Reload and write back to binary
 r2 = pycolmap.Reconstruction()
 r2.read_text(str(txt_path))
+
+# Remove stale rig binary files so the clean write doesn't conflict with them.
+for _f in ['frames.bin', 'rigs.bin']:
+    _p = sparse / _f
+    if _p.exists():
+        _p.unlink()
+
 r2.write_binary(str(sparse))
 shutil.rmtree(str(txt_path))
 
