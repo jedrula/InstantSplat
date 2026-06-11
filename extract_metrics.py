@@ -153,23 +153,38 @@ def extract_nerfstudio_metrics(pod_dir: str) -> dict:
 # ── gsplat simple_trainer log ─────────────────────────────────────────────────
 
 def extract_gsplat_metrics(pod_dir: str) -> dict:
-    """Read final loss + Gaussian count from gsplat training log."""
+    """Read PSNR/SSIM/LPIPS + loss + Gaussian count from gsplat outputs."""
+    result = {}
+
+    # Val stats JSON written by simple_trainer eval() — prefer this for PSNR
+    stats_dir = os.path.join(pod_dir, "gsplat_output", "stats")
+    if os.path.isdir(stats_dir):
+        val_files = sorted(glob(os.path.join(stats_dir, "val_step*.json")))
+        if val_files:
+            try:
+                with open(val_files[-1]) as f:
+                    s = json.load(f)
+                for key in ("psnr", "ssim", "lpips"):
+                    if key in s:
+                        result[key] = round(float(s[key]), 4)
+                if "num_GS" in s:
+                    result["gaussian_count"] = int(s["num_GS"])
+            except Exception:
+                pass
+
+    # Training log for loss + gaussian count (fallback if stats JSON missing)
     log = os.path.join(pod_dir, "02_train.log")
-    if not os.path.exists(log):
-        return {}
-    import re
-    last_step = None
-    with open(log) as f:
-        for line in f:
-            # "[train] step 7000/7000  loss=0.0116  GS=438519  t=166s"
-            m = re.search(r"\[train\] step (\d+)/(\d+)\s+loss=([\d.]+)\s+GS=(\d+)", line)
-            if m:
-                last_step = {
-                    "step": int(m.group(1)),
-                    "train_loss": round(float(m.group(3)), 5),
-                    "gaussian_count": int(m.group(4)),
-                }
-    return last_step or {}
+    if os.path.exists(log):
+        import re
+        with open(log) as f:
+            for line in f:
+                m = re.search(r"\[train\] step (\d+)/(\d+)\s+loss=([\d.]+)\s+GS=(\d+)", line)
+                if m:
+                    result["train_loss"] = round(float(m.group(3)), 5)
+                    if "gaussian_count" not in result:
+                        result["gaussian_count"] = int(m.group(4))
+
+    return result
 
 
 # ── SfM sparse model stats ────────────────────────────────────────────────────
@@ -248,6 +263,28 @@ def extract_splat_stats(pod_dir: str) -> dict:
     return {}
 
 
+# ── Brush log ────────────────────────────────────────────────────────────────
+
+def extract_brush_metrics(pod_dir: str) -> dict:
+    """Read PSNR/SSIM from Brush training log (RUST_LOG=brush_cli=info format).
+    Brush emits: 'Eval iter N: PSNR X.XXXX, ssim Y.YYYY'
+    We take the last eval line (end of training).
+    """
+    import re
+    log = os.path.join(pod_dir, "02_train.log")
+    if not os.path.exists(log):
+        return {}
+    result = {}
+    pattern = re.compile(r"Eval iter \d+: PSNR ([\d.]+), ssim ([\d.]+)")
+    with open(log) as f:
+        for line in f:
+            m = pattern.search(line)
+            if m:
+                result["psnr"] = round(float(m.group(1)), 4)
+                result["ssim"] = round(float(m.group(2)), 4)
+    return result
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -260,14 +297,18 @@ def main():
 
     metrics = {}
 
-    # Training metrics (nerfstudio or gsplat)
+    # Training metrics (nerfstudio, gsplat, or brush)
     ns_metrics = extract_nerfstudio_metrics(pod_dir)
     if ns_metrics:
         metrics.update(ns_metrics)
     else:
         gsplat = extract_gsplat_metrics(pod_dir)
-        if "train_loss" in gsplat:
-            metrics["train_loss"] = gsplat["train_loss"]
+        for key in ("psnr", "ssim", "lpips", "train_loss"):
+            if key in gsplat:
+                metrics[key] = gsplat[key]
+        if "psnr" not in metrics:
+            brush = extract_brush_metrics(pod_dir)
+            metrics.update(brush)
 
     # Splat/Gaussian stats
     metrics.update(extract_splat_stats(pod_dir))

@@ -1,12 +1,14 @@
 import json
 import os
 import struct
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import tqdm as _tqdm_module
 from PIL import Image
 try:
     from pycolmap import SceneManager
@@ -310,6 +312,7 @@ class Parser:
         test_every: int = 8,
         fast_init: bool = False,
         mask_dir: Optional[str] = None,
+        load_exposure: bool = False,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -516,6 +519,12 @@ class Parser:
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
         self.mask_dict = mask_dict  # Dict of camera_id -> mask (fisheye ROI only)
 
+        # 0-based contiguous camera indices — needed by PPISP and other per-camera modules.
+        unique_camera_ids = sorted(set(camera_ids))
+        self.camera_id_to_idx = {cid: idx for idx, cid in enumerate(unique_camera_ids)}
+        self.camera_indices = [self.camera_id_to_idx[cid] for cid in camera_ids]
+        self.num_cameras = len(unique_camera_ids)
+
         # Per-image masks loaded from mask_dir (e.g. DA3-refined wall masks).
         if mask_dir is not None:
             self.image_masks = []
@@ -536,6 +545,26 @@ class Parser:
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
+
+        # Load EXIF exposure data if requested.
+        self.load_exposure = load_exposure
+        if load_exposure:
+            from exif import compute_exposure_from_exif  # gsplat examples/exif.py
+            exposure_values: List[Optional[float]] = []
+            for image_name in _tqdm_module.tqdm(image_names, desc="Loading EXIF exposure"):
+                original_path = Path(colmap_image_dir) / image_name
+                exposure_values.append(compute_exposure_from_exif(original_path))
+            valid = [e for e in exposure_values if e is not None]
+            if valid:
+                exposure_mean = sum(valid) / len(valid)
+                self.exposure_values = [
+                    (e - exposure_mean) if e is not None else None
+                    for e in exposure_values
+                ]
+            else:
+                self.exposure_values = [None] * len(image_names)
+        else:
+            self.exposure_values = [None] * len(image_names)
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.
@@ -690,12 +719,17 @@ class Dataset:
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
+            "camera_idx": self.parser.camera_indices[index],  # 0-based contiguous camera index
         }
         # Per-image mask (DA3 or similar) takes priority; fall back to camera-level ROI mask.
         if image_mask is not None:
             data["mask"] = torch.from_numpy(image_mask).bool()
         elif mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+
+        exposure = self.parser.exposure_values[index]
+        if exposure is not None:
+            data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
 
         if self.load_depths:
             # projected points to image plane to get depths

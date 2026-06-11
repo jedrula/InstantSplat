@@ -34,6 +34,8 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 # Override INSTANTSPLAT_PYTHON env var for non-default conda locations
 PYTHON="${INSTANTSPLAT_PYTHON:-${HOME}/miniconda3/envs/instantsplat/bin/python}"
 CONDA_BIN="$(dirname "$PYTHON")"
+ONTHEFLY_PYTHON="${ONTHEFLY_PYTHON:-${HOME}/miniconda3/envs/onthefly_nvs/bin/python}"
+ONTHEFLY_REPO="${ONTHEFLY_REPO:-${HOME}/workdir/on-the-fly-nvs}"
 
 # ── Arg parsing ──────────────────────────────────────────────────────────────
 ITERS=""
@@ -45,8 +47,13 @@ SMART_FRAMES=0
 SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
-SFM="mast3r"       # mast3r | fast3r | colmap | glomap | glomap_lg | glomap_disk | glomap_sp | glomap_loftr | colmap_lg | fastmap | realityscan
-TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat
+SFM="mast3r"       # mast3r | fast3r | colmap | glomap | glomap_lg | glomap_disk | glomap_sp | glomap_loftr | colmap_lg | fastmap | realityscan | onthefly
+TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat | onthefly | brush
+MCMC=0              # 1 = use MCMCStrategy (gsplat only); 0 = DefaultStrategy+absgrad
+GSPLAT_POST_PROCESSING=""   # "" | bilateral_grid | ppisp
+GSPLAT_SSIM_LAMBDA="0.2"
+VIEWER_PORT=""      # empty = disable viewer; set to a port number to enable viser viewer
+ONTHEFLY_ITERS=30       # per-keyframe iterations for on-the-fly NVS (--sfm onthefly)
 COLMAP_BA=0
 COLMAP_MATCHER=""
 NO_POINT_CAP=0
@@ -78,6 +85,10 @@ while [[ $# -gt 0 ]]; do
         --sparse-ga)    SPARSE_GA=1;       shift ;;
         --sfm)              SFM="$2";            shift 2 ;;
         --trainer)          TRAINER="$2";        shift 2 ;;
+        --mcmc)             MCMC=1;              shift ;;
+        --post-processing)  GSPLAT_POST_PROCESSING="$2"; shift 2 ;;
+        --ssim-lambda)      GSPLAT_SSIM_LAMBDA="$2";     shift 2 ;;
+        --viewer-port)      VIEWER_PORT="$2";    shift 2 ;;
         --engine)           # deprecated: map to --sfm + --trainer
             case "$2" in
                 pgsr)    SFM="mast3r";  TRAINER="pgsr" ;;
@@ -91,6 +102,7 @@ while [[ $# -gt 0 ]]; do
                 colmap_lg)    SFM="colmap_lg";    TRAINER="instantsplat" ;;
                 fastmap)      SFM="fastmap";      TRAINER="instantsplat" ;;
                 realityscan)  SFM="realityscan"; TRAINER="instantsplat" ;;
+                onthefly)     SFM="onthefly";    TRAINER="onthefly" ;;
                 *)            SFM="mast3r";      TRAINER="instantsplat" ;;
             esac
             shift 2 ;;
@@ -130,8 +142,9 @@ USAGE="Usage:
 
 [[ "$SKIP_EXTRACTION" != "1" && ${#VIDEOS[@]} -eq 0 ]] && { echo "$USAGE"; exit 1; }
 [[ -z "$SCENE" ]]          && { echo "Error: --scene is required"; echo "$USAGE"; exit 1; }
-[[ -z "$ITERS" && "$FRAMES_ONLY" != "1" ]] && { echo "Error: --iters is required"; echo "$USAGE"; exit 1; }
+[[ -z "$ITERS" && "$FRAMES_ONLY" != "1" && "$SFM" != "onthefly" ]] && { echo "Error: --iters is required"; echo "$USAGE"; exit 1; }
 ITERS="${ITERS:-0}"
+[[ "$SFM" == "onthefly" ]] && TRAINER="onthefly"
 
 if [[ "$SKIP_EXTRACTION" != "1" ]]; then
     if [[ -n "$FPS_LIST" && -n "$NFRAMES_LIST" ]]; then
@@ -390,6 +403,7 @@ elif [[ "$SFM" == "glomap" ]]; then
         --ImageReader.camera_model PINHOLE \
         --ImageReader.single_camera 1 \
         --FeatureExtraction.use_gpu 1 \
+        --FeatureExtraction.max_image_size 1600 \
         2>&1 | tee "$MODEL_DIR/01a_glomap_features.log"
 
     _MATCHER="${COLMAP_MATCHER}"
@@ -560,6 +574,7 @@ elif [[ "$SFM" == "fastmap" ]]; then
         --ImageReader.camera_model PINHOLE \
         --ImageReader.single_camera 1 \
         --FeatureExtraction.use_gpu 1 \
+        --FeatureExtraction.max_image_size 1600 \
         2>&1 | tee "$MODEL_DIR/01a_fastmap_features.log"
 
     _MATCHER="${COLMAP_MATCHER}"
@@ -792,6 +807,15 @@ print(f'  → text→binary: {len(r.cameras)} cameras, {len(r.images)} images, {
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01c_rs_convert.log"
+elif [[ "$SFM" == "onthefly" ]]; then
+    ONTHEFLY_OUT="$MODEL_DIR/onthefly_out"
+    echo "[2/3] On-the-fly NVS — joint SfM+Gaussian training (${ONTHEFLY_ITERS} iters/keyframe)..."
+    (cd "$ONTHEFLY_REPO" && "$ONTHEFLY_PYTHON" train.py \
+        -s "$SCENE_DIR" \
+        --images_dir images \
+        -m "$ONTHEFLY_OUT" \
+        --num_iterations "$ONTHEFLY_ITERS") \
+        2>&1 | tee "$MODEL_DIR/02_onthefly.log"
 else
     # Clear any cache left by a previous crashed run; stale SparseGA cache causes
     # device-side assert when tensor shapes no longer match the new image set.
@@ -828,6 +852,19 @@ if [[ -d "$_PC_SRC" ]]; then
         --output_type PLY 2>/dev/null || true
 fi
 
+# Copy COLMAP sparse into pod so it is self-contained for LichtFeld / re-training
+if [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || \
+      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || \
+      "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+    if [[ -d "$SPARSE_PARENT" ]]; then
+        cp -r "$SPARSE_PARENT" "$MODEL_DIR/"
+        # Thin colmap/ dir so LichtFeld can load without hitting the meta.json SOG check
+        mkdir -p "$MODEL_DIR/colmap"
+        ln -sfn ../sparse "$MODEL_DIR/colmap/sparse"
+        ln -sfn ../images "$MODEL_DIR/colmap/images"
+    fi
+fi
+
 SFM_END=$(date +%s)
 SFM_ELAPSED=$(( SFM_END - SFM_START ))
 SFM_MIN=$(awk "BEGIN {printf \"%.1f\", $SFM_ELAPSED / 60}")
@@ -856,7 +893,9 @@ RAM_AVAIL=$(free -h | awk '/^Mem:/ {print $7}')
 VRAM_USED=$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{printf "%d/%d MiB", $1, $2}')
 echo "    RAM available: $RAM_AVAIL  |  VRAM: $VRAM_USED"
 
-if [[ "$TRAINER" == "splatfacto" ]]; then
+if [[ "$SFM" == "onthefly" ]]; then
+    echo "[2/3] On-the-fly: training completed in combined SfM+train step."
+elif [[ "$TRAINER" == "splatfacto" ]]; then
     echo "[2/3] nerfstudio splatfacto training ($ITERS iterations, $TOTAL_FRAMES frames)..."
     NS_PROCESS_DIR="$MODEL_DIR/ns_input"
     NS_TRAIN_DIR="$MODEL_DIR/ns_train"
@@ -933,18 +972,85 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
     # gsplat via InstantSplat/simple_trainer.py — already proven on this 8GB machine
     [[ "$SFM" != "colmap" && "$SFM" != "glomap" && "$SFM" != "glomap_lg" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_sp" && "$SFM" != "colmap_lg" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
-    echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames)..."
-    # DefaultStrategy defaults are tuned for 30K iters (refine_stop=15K, reset_every=3K).
-    # When ITERS is shorter, densification runs through 100% of training → runaway
-    # Gaussian growth (2K→600K) → 15 dB PSNR instead of ~30 dB.
-    # Scale proportionally: stop densifying at ITERS/2, reset every ITERS/10.
+    echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames, mcmc=$MCMC, post_processing=${GSPLAT_POST_PROCESSING:-none})..."
+    _GSPLAT_PP_ARGS=()
+    [[ -n "$GSPLAT_POST_PROCESSING" ]] && _GSPLAT_PP_ARGS=(--post-processing "$GSPLAT_POST_PROCESSING")
+    if [[ "$MCMC" == "1" ]]; then
+        # MCMCStrategy: stochastic relocation, no hard opacity resets, no runaway growth.
+        # Preset "mcmc" already sets opacity_reg=0.01, scale_reg=0.01, init_opa=0.5, init_scale=0.1.
+        # Scale refine_stop proportionally (default 25K/30K = 83%).
+        _GS_MCMC_STOP=$(( ITERS * 5 / 6 ))
+        _GSPLAT_VIEWER_ARGS=("--disable-viewer")
+        [[ -n "$VIEWER_PORT" ]] && _GSPLAT_VIEWER_ARGS+=("--port" "$VIEWER_PORT")
+        PYTHONPATH="$REPO/../gsplat/examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "$PYTHON" "$REPO/../gsplat/examples/simple_trainer.py" mcmc \
+            --data-dir "$SCENE_DIR" \
+            --data-factor 1 \
+            --result-dir "$GSPLAT_OUT" \
+            --max-steps "$ITERS" \
+            --eval-steps "$ITERS" \
+            --save-steps "$ITERS" \
+            --ply-steps "$ITERS" \
+            --save-ply \
+            --init-type sfm \
+            --fast-init \
+            "${_GSPLAT_VIEWER_ARGS[@]}" \
+            --disable-video \
+            --ssim-lambda "$GSPLAT_SSIM_LAMBDA" \
+            "${_GSPLAT_PP_ARGS[@]}" \
+            --opacity-reg 0.05 \
+            --strategy.cap-max 2000000 \
+            --strategy.refine-stop-iter "$_GS_MCMC_STOP" \
+            2>&1 | tee "$MODEL_DIR/02_train.log"
+    else
+        # DefaultStrategy + AbsGS. grow_grad2d MUST be raised from 0.0002 when using absgrad.
+        # Scale refine_stop and reset_every proportionally for shorter runs.
+        _GS_REFINE_STOP=$(( ITERS / 2 ))
+        _GS_RESET_EVERY=$(( ITERS / 10 < 100 ? 100 : ITERS / 10 ))
+        _GSPLAT_VIEWER_ARGS=("--disable-viewer")
+        [[ -n "$VIEWER_PORT" ]] && _GSPLAT_VIEWER_ARGS+=("--port" "$VIEWER_PORT")
+        PYTHONPATH="$REPO/../gsplat/examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/../gsplat/examples/simple_trainer.py" default \
+            --data-dir "$SCENE_DIR" \
+            --data-factor 1 \
+            --result-dir "$GSPLAT_OUT" \
+            --max-steps "$ITERS" \
+            --eval-steps "$ITERS" \
+            --save-steps "$ITERS" \
+            --ply-steps "$ITERS" \
+            --save-ply \
+            --init-type sfm \
+            --fast-init \
+            "${_GSPLAT_VIEWER_ARGS[@]}" \
+            --disable-video \
+            --ssim-lambda "$GSPLAT_SSIM_LAMBDA" \
+            "${_GSPLAT_PP_ARGS[@]}" \
+            --strategy.refine-stop-iter "$_GS_REFINE_STOP" \
+            --strategy.reset-every "$_GS_RESET_EVERY" \
+            --strategy.absgrad \
+            --strategy.grow-grad2d 0.0006 \
+            --strategy.prune-opa 0.05 \
+            --opacity-reg 0.01 \
+            --scale-reg 0.01 \
+            2>&1 | tee "$MODEL_DIR/02_train.log"
+    fi
+    # Extract initial camera (uses colmap_to_ply_transform.npy saved by simple_trainer.py)
+    python3 "$REPO/camera_from_colmap.py" \
+        --sparse     "$SPARSE_PARENT/0" \
+        --trainer    gsplat \
+        --result-dir "$GSPLAT_OUT" \
+        --splat      "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
+        --out        "$MODEL_DIR/initial_camera.json" \
+        2>/dev/null || true
+elif [[ "$TRAINER" == "2dgs" ]]; then
+    [[ "$SFM" != "colmap" && "$SFM" != "glomap" && "$SFM" != "glomap_lg" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_sp" && "$SFM" != "colmap_lg" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     _GS_REFINE_STOP=$(( ITERS / 2 ))
-    _GS_RESET_EVERY=$(( ITERS / 10 < 100 ? 100 : ITERS / 10 ))
-    PYTHONPATH="$REPO/gsplat_examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/simple_trainer.py" default \
+    echo "[2/3] 2DGS training ($ITERS iterations, $TOTAL_FRAMES frames)..."
+    PYTHONPATH="$REPO/../gsplat/examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/../gsplat/examples/simple_trainer_2dgs.py" \
         --data-dir "$SCENE_DIR" \
         --data-factor 1 \
         --result-dir "$GSPLAT_OUT" \
         --max-steps "$ITERS" \
+        --eval-steps "$ITERS" \
         --save-steps "$ITERS" \
         --ply-steps "$ITERS" \
         --save-ply \
@@ -952,17 +1058,39 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         --fast-init \
         --disable-viewer \
         --disable-video \
-        --ssim-lambda 0.2 \
-        --strategy.refine-stop-iter "$_GS_REFINE_STOP" \
-        --strategy.reset-every "$_GS_RESET_EVERY" \
-        --strategy.absgrad \
-        --max-gs 500000 \
+        --ssim-lambda "$GSPLAT_SSIM_LAMBDA" \
+        --prune-opa 0.05 \
+        --refine-stop-iter "$_GS_REFINE_STOP" \
         2>&1 | tee "$MODEL_DIR/02_train.log"
-    # Extract initial camera (uses colmap_to_ply_transform.npy saved by simple_trainer.py)
     python3 "$REPO/camera_from_colmap.py" \
         --sparse     "$SPARSE_PARENT/0" \
         --trainer    gsplat \
         --result-dir "$GSPLAT_OUT" \
+        --splat      "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
+        --out        "$MODEL_DIR/initial_camera.json" \
+        2>/dev/null || true
+elif [[ "$TRAINER" == "brush" ]]; then
+    # Brush: Rust-based MCMC-style trainer; headless by default (no --with-viewer).
+    # Accepts COLMAP format: scene_dir must have images/ and sparse/0/.
+    [[ "$SFM" != "colmap" && "$SFM" != "glomap" && "$SFM" != "glomap_lg" && \
+       "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_sp" && \
+       "$SFM" != "colmap_lg" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && \
+        ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    BRUSH_BIN="${BRUSH_BIN:-/home/communications/workdir/brush/brush-app-x86_64-unknown-linux-gnu/brush_app}"
+    BRUSH_OUT="$MODEL_DIR/brush_output"
+    mkdir -p "$BRUSH_OUT"
+    echo "[2/3] Brush training ($ITERS iterations, $TOTAL_FRAMES frames)..."
+    RUST_LOG=brush_cli=info "$BRUSH_BIN" "$SCENE_DIR" \
+        --total-steps "$ITERS" \
+        --export-path "$BRUSH_OUT" \
+        --export-every "$ITERS" \
+        --eval-split-every 8 \
+        2>&1 | tee "$MODEL_DIR/02_train.log"
+    SPARSE_PARENT="$SCENE_DIR/sparse"
+    python3 "$REPO/camera_from_colmap.py" \
+        --sparse     "$SPARSE_PARENT/0" \
+        --trainer    brush \
+        --result-dir "$BRUSH_OUT" \
         --splat      "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
         --out        "$MODEL_DIR/initial_camera.json" \
         2>/dev/null || true
@@ -1012,8 +1140,21 @@ METRICS_JSON=$("$PYTHON" "$REPO/extract_metrics.py" "$MODEL_DIR" "$SPARSE_PARENT
 emit_event "{\"event\":\"train_done\",\"elapsed_s\":$TRAIN_ELAPSED,\"early_stopped\":$EARLY_STOPPED_FLAG,\"stopped_at_iter\":$STOPPED_AT_ITER,\"metrics\":$METRICS_JSON}"
 
 # Resolve PLY path — differs by trainer
-if [[ "$TRAINER" == "gsplat" ]]; then
+if [[ "$SFM" == "onthefly" ]]; then
+    ONTHEFLY_OUT="$MODEL_DIR/onthefly_out"
+    N_ANCHORS=$(find "$ONTHEFLY_OUT/point_clouds" -name "anchor_*.ply" 2>/dev/null | wc -l)
+    (( N_ANCHORS > 1 )) && echo "    ⚠  on-the-fly produced $N_ANCHORS anchors — using anchor_0.ply (multi-anchor merge not implemented)"
+    PLY="$ONTHEFLY_OUT/point_clouds/anchor_0.ply"
+    [[ ! -f "$PLY" ]] && { echo "Error: $PLY not found. Check $MODEL_DIR/02_onthefly.log"; exit 1; }
+    ACTUAL_ITER=$ONTHEFLY_ITERS
+elif [[ "$TRAINER" == "gsplat" ]]; then
     PLY=$(find "$MODEL_DIR/gsplat_output/ply" -name "*.ply" 2>/dev/null | sort | tail -1)
+    ACTUAL_ITER=$ITERS
+elif [[ "$TRAINER" == "2dgs" ]]; then
+    PLY=$(find "$MODEL_DIR/gsplat_output/point_cloud" -name "*.ply" 2>/dev/null | sort | tail -1)
+    ACTUAL_ITER=$ITERS
+elif [[ "$TRAINER" == "brush" ]]; then
+    PLY=$(find "$MODEL_DIR/brush_output" -name "*.ply" 2>/dev/null | sort | tail -1)
     ACTUAL_ITER=$ITERS
 elif [[ "$TRAINER" == "splatfacto" ]]; then
     NS_CONFIG=$(find "$MODEL_DIR/ns_train" -name "config.yml" 2>/dev/null | sort | tail -1)
@@ -1070,6 +1211,13 @@ EOF
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
+# Remove sparse from assets/examples — canonical copy is now in the pod
+if [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || \
+      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || \
+      "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+    [[ -d "$SPARSE_PARENT" ]] && rm -rf "$SPARSE_PARENT"
+fi
+
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  Done! $(date '+%Y-%m-%d %H:%M:%S')  (${ELAPSED_MIN} min)"
 echo "╠══════════════════════════════════════════════════════╣"
