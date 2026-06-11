@@ -47,7 +47,7 @@ SMART_FRAMES=0
 SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
-SFM="mast3r"       # mast3r | fast3r | colmap | glomap | glomap_lg | glomap_disk | glomap_sp | glomap_loftr | colmap_lg | fastmap | realityscan | onthefly
+SFM="mast3r"       # mast3r | fast3r | colmap_sift | glomap_sift | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | colmap_aliked | fastmap | realityscan | onthefly
 TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat | onthefly | brush
 MCMC=0              # 1 = use MCMCStrategy (gsplat only); 0 = DefaultStrategy+absgrad
 GSPLAT_POST_PROCESSING=""   # "" | bilateral_grid | ppisp
@@ -93,13 +93,13 @@ while [[ $# -gt 0 ]]; do
             case "$2" in
                 pgsr)    SFM="mast3r";  TRAINER="pgsr" ;;
                 fast3r)  SFM="fast3r";  TRAINER="instantsplat" ;;
-                colmap)  SFM="colmap";  TRAINER="instantsplat" ;;
-                glomap)  SFM="glomap";  TRAINER="instantsplat" ;;
-                glomap_lg)    SFM="glomap_lg";    TRAINER="instantsplat" ;;
+                colmap)  SFM="colmap_sift";  TRAINER="instantsplat" ;;
+                glomap)  SFM="glomap_sift";  TRAINER="instantsplat" ;;
+                glomap_aliked)    SFM="glomap_aliked";    TRAINER="instantsplat" ;;
                 glomap_disk)  SFM="glomap_disk";  TRAINER="instantsplat" ;;
-                glomap_sp)    SFM="glomap_sp";    TRAINER="instantsplat" ;;
+                glomap_superpoint)    SFM="glomap_superpoint";    TRAINER="instantsplat" ;;
                 glomap_loftr) SFM="glomap_loftr"; TRAINER="instantsplat" ;;
-                colmap_lg)    SFM="colmap_lg";    TRAINER="instantsplat" ;;
+                colmap_aliked)    SFM="colmap_aliked";    TRAINER="instantsplat" ;;
                 fastmap)      SFM="fastmap";      TRAINER="instantsplat" ;;
                 realityscan)  SFM="realityscan"; TRAINER="instantsplat" ;;
                 onthefly)     SFM="onthefly";    TRAINER="onthefly" ;;
@@ -314,7 +314,7 @@ if [[ "$SFM" == "fast3r" ]]; then
         --co_vis_dsp \
         $INIT_GEO_ARGS \
         2>&1 | tee "$MODEL_DIR/01_init_geo.log"
-elif [[ "$SFM" == "colmap" ]]; then
+elif [[ "$SFM" == "colmap_sift" ]]; then
     echo "[2/3] COLMAP features + matching + incremental SfM ($TOTAL_FRAMES frames)..."
     DB_PATH="$SCENE_DIR/database.db"
     SPARSE_PARENT="$SCENE_DIR/sparse"
@@ -386,7 +386,7 @@ elif [[ "$SFM" == "colmap" ]]; then
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01e_colmap_convert.log"
-elif [[ "$SFM" == "glomap" ]]; then
+elif [[ "$SFM" == "glomap_sift" ]]; then
     echo "[2/3] COLMAP features + matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
     DB_PATH="$SCENE_DIR/database.db"
     SPARSE_PARENT="$SCENE_DIR/sparse"
@@ -456,7 +456,7 @@ elif [[ "$SFM" == "glomap" ]]; then
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01e_glomap_convert.log"
-elif [[ "$SFM" == "glomap_lg" ]]; then
+elif [[ "$SFM" == "glomap_aliked" ]]; then
     echo "[2/3] ALIKED+LightGlue features + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
     SPARSE_PARENT="$SCENE_DIR/sparse"
     rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
@@ -468,23 +468,23 @@ elif [[ "$SFM" == "glomap_lg" ]]; then
         "$HLOC_WORK" \
         --matcher aliked+lightglue \
         --colmap-bin "$CONDA_BIN/colmap" \
-        2>&1 | tee "$MODEL_DIR/01_glomap_lg.log"
+        2>&1 | tee "$MODEL_DIR/01_glomap_aliked.log"
 
     if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
-        echo "Error: glomap_hloc produced no reconstruction. Check $MODEL_DIR/01_glomap_lg.log"
+        echo "Error: glomap_hloc produced no reconstruction. Check $MODEL_DIR/01_glomap_aliked.log"
         exit 1
     fi
 
     mv "$HLOC_WORK/sparse/0" "$SPARSE_PARENT/0"
 
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
-        "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_lg_filter.log"
+        "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_aliked_filter.log"
 
     "$CONDA_BIN/colmap" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
-        2>&1 | tee "$MODEL_DIR/01c_glomap_lg_convert.log"
+        2>&1 | tee "$MODEL_DIR/01c_glomap_aliked_convert.log"
 elif [[ "$SFM" == "glomap_loftr" ]]; then
     echo "[2/3] LoFTR semi-dense matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
     SPARSE_PARENT="$SCENE_DIR/sparse"
@@ -514,11 +514,11 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01c_glomap_loftr_convert.log"
-elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || "$SFM" == "colmap_lg" ]]; then
+elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" ]]; then
     case "$SFM" in
         glomap_disk) _MATCHER="disk+lightglue";       _MAPPER="glomap" ;;
-        glomap_sp)   _MATCHER="superpoint+lightglue"; _MAPPER="glomap" ;;
-        colmap_lg)   _MATCHER="aliked+lightglue";     _MAPPER="colmap" ;;
+        glomap_superpoint)   _MATCHER="superpoint+lightglue"; _MAPPER="glomap" ;;
+        colmap_aliked)   _MATCHER="aliked+lightglue";     _MAPPER="colmap" ;;
     esac
     echo "[2/3] hloc($_MATCHER) + $_MAPPER SfM ($TOTAL_FRAMES frames)..."
     SPARSE_PARENT="$SCENE_DIR/sparse"
@@ -840,7 +840,7 @@ else
         2>&1 | tee "$MODEL_DIR/01_init_geo.log"
 fi
 # Export sparse point cloud as PLY for browser preview
-if [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
     _PC_SRC="$SCENE_DIR/sparse/0"
 else
     _PC_SRC="$SCENE_DIR/sparse_${TOTAL_FRAMES}/0"
@@ -853,9 +853,9 @@ if [[ -d "$_PC_SRC" ]]; then
 fi
 
 # Copy COLMAP sparse into pod so it is self-contained for LichtFeld / re-training
-if [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || \
-      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || \
-      "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || \
+      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
+      "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
     if [[ -d "$SPARSE_PARENT" ]]; then
         cp -r "$SPARSE_PARENT" "$MODEL_DIR/"
         # Thin colmap/ dir so LichtFeld can load without hitting the meta.json SOG check
@@ -943,7 +943,7 @@ elif [[ "$TRAINER" == "splatfacto" ]]; then
             2>/dev/null || true
 elif [[ "$TRAINER" == "pgsr" ]]; then
     # For mast3r/fast3r, symlink sparse → sparse_N so sparse/0/ exists.
-    [[ "$SFM" != "colmap" && "$SFM" != "glomap" && "$SFM" != "glomap_lg" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_sp" && "$SFM" != "colmap_lg" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     # PGSR looks for sparse/images.bin (no 0/ subdir) — symlink files up from sparse/0/
     for _f in cameras.txt images.txt points3D.txt cameras.bin images.bin points3D.bin; do
         [[ -f "$SCENE_DIR/sparse/0/$_f" ]] && \
@@ -970,7 +970,7 @@ elif [[ "$TRAINER" == "pgsr" ]]; then
         2>/dev/null || true
 elif [[ "$TRAINER" == "gsplat" ]]; then
     # gsplat via InstantSplat/simple_trainer.py — already proven on this 8GB machine
-    [[ "$SFM" != "colmap" && "$SFM" != "glomap" && "$SFM" != "glomap_lg" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_sp" && "$SFM" != "colmap_lg" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames, mcmc=$MCMC, post_processing=${GSPLAT_POST_PROCESSING:-none})..."
     _GSPLAT_PP_ARGS=()
@@ -1041,7 +1041,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         --out        "$MODEL_DIR/initial_camera.json" \
         2>/dev/null || true
 elif [[ "$TRAINER" == "2dgs" ]]; then
-    [[ "$SFM" != "colmap" && "$SFM" != "glomap" && "$SFM" != "glomap_lg" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_sp" && "$SFM" != "colmap_lg" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     _GS_REFINE_STOP=$(( ITERS / 2 ))
     echo "[2/3] 2DGS training ($ITERS iterations, $TOTAL_FRAMES frames)..."
@@ -1072,9 +1072,9 @@ elif [[ "$TRAINER" == "2dgs" ]]; then
 elif [[ "$TRAINER" == "brush" ]]; then
     # Brush: Rust-based MCMC-style trainer; headless by default (no --with-viewer).
     # Accepts COLMAP format: scene_dir must have images/ and sparse/0/.
-    [[ "$SFM" != "colmap" && "$SFM" != "glomap" && "$SFM" != "glomap_lg" && \
-       "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_sp" && \
-       "$SFM" != "colmap_lg" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && \
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && \
+       "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && \
+       "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && \
         ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     BRUSH_BIN="${BRUSH_BIN:-/home/communications/workdir/brush/brush-app-x86_64-unknown-linux-gnu/brush_app}"
     BRUSH_OUT="$MODEL_DIR/brush_output"
@@ -1098,10 +1098,10 @@ else
     # instantsplat trainer
     # train.py looks for sparse_{N}/0/ — COLMAP/GLOMAP/FastMap write sparse/0/ instead;
     # symlink sparse_N → sparse so the scene loader finds it.
-    [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && ln -sfn "sparse" "$SCENE_DIR/sparse_${TOTAL_FRAMES}" 2>/dev/null || true
+    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && ln -sfn "sparse" "$SCENE_DIR/sparse_${TOTAL_FRAMES}" 2>/dev/null || true
     # --pp_optimizer requires confidence_dsp.npy from init_geo.py (MASt3R/Fast3R only)
     PP_OPT_ARG="--pp_optimizer"
-    [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && PP_OPT_ARG=""
+    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && PP_OPT_ARG=""
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
         -s "$SCENE_DIR" \
         -m "$MODEL_DIR" \
@@ -1212,9 +1212,9 @@ EOF
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 # Remove sparse from assets/examples — canonical copy is now in the pod
-if [[ "$SFM" == "colmap" || "$SFM" == "glomap" || "$SFM" == "glomap_lg" || \
-      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_sp" || \
-      "$SFM" == "colmap_lg" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || \
+      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
+      "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
     [[ -d "$SPARSE_PARENT" ]] && rm -rf "$SPARSE_PARENT"
 fi
 
