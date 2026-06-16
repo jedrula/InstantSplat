@@ -53,6 +53,13 @@ from pathlib import Path
 
 import numpy as np
 
+# Minimum wall height (meters in COLMAP space) visible when the scene loads.
+# The initial camera is pulled back from the scene centroid until this many
+# metres of wall are visible within the camera's vertical field of view.
+MIN_WALL_HEIGHT_M = 3.0
+# Additional metres added on top of the double-deficit pullback.
+PULLBACK_EXTRA_M = 1.5
+
 
 # ── COLMAP binary readers ──────────────────────────────────────────────────────
 
@@ -206,6 +213,58 @@ def _scene_centroid_from_splat(splat_path: Path | None) -> np.ndarray | None:
         return None
 
 
+# ── FOV + distance helpers ────────────────────────────────────────────────────
+
+def _read_fov_y_from_cameras_txt(sparse_dir: Path) -> float | None:
+    """Return vertical FOV in radians from sparse/0/cameras.txt, or None."""
+    p = sparse_dir / "cameras.txt"
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                model = parts[1].upper()
+                try:
+                    w, h = int(parts[2]), int(parts[3])
+                except ValueError:
+                    continue
+                if not (0 < w < 20000 and 0 < h < 20000):
+                    continue
+                params = list(map(float, parts[4:]))
+                # PINHOLE/OPENCV: params = [fx, fy, cx, cy, ...] → use fy
+                if model in ("PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV") and len(params) > 1:
+                    fl_y = params[1]
+                else:
+                    fl_y = params[0]
+                if fl_y > 0:
+                    return 2 * math.atan(h / (2 * fl_y))
+    except Exception:
+        pass
+    return None
+
+
+def _pullback_position(pos: np.ndarray, look_at: np.ndarray,
+                       fwd_level: np.ndarray, min_dist: float,
+                       extra: float = 0.0) -> np.ndarray:
+    """
+    If pos is closer than min_dist to look_at (along fwd_level), pull it back.
+    Applies the deficit twice then adds `extra` scene units on top.
+    """
+    current_depth = float(np.dot(look_at - pos, fwd_level))
+    if current_depth < min_dist:
+        target = 2 * min_dist - current_depth + extra
+        new_pos = look_at - fwd_level * target
+        print(f"  Pullback: depth {current_depth:.2f} → {target:.2f} units "
+              f"(want {MIN_WALL_HEIGHT_M}m wall visible, +{extra:.2f} extra)", flush=True)
+        return new_pos
+    return pos
+
+
 # ── Camera selection ──────────────────────────────────────────────────────────
 
 def _normalize(v):
@@ -243,7 +302,8 @@ def _select_best(cameras_training):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_from_transforms(frames, AT, R_dt, t_dt, scale, out_path, pin_frame, splat_path=None):
+def run_from_transforms(frames, AT, R_dt, t_dt, scale, out_path, pin_frame,
+                        splat_path=None, fov_y: float | None = None):
     """
     For splatfacto: use the frames list from transforms.json directly.
     Poses are in OpenGL convention in transforms.json world space.
@@ -310,8 +370,17 @@ def run_from_transforms(frames, AT, R_dt, t_dt, scale, out_path, pin_frame, spla
         look_dist = float(np.sort(bbox)[1]) * 0.5   # median dimension * 0.5
         look_at = cam_centroid + fwd_level * look_dist
 
+    # Ensure the initial camera is far enough back to see MIN_WALL_HEIGHT_M vertically.
+    # splatfacto PLY is in ns_input space ≈ COLMAP metres, so min_dist is in metres.
+    if fov_y and fov_y > 0:
+        min_dist = (MIN_WALL_HEIGHT_M / 2) / math.tan(fov_y / 2)
+    else:
+        min_dist = 2.5
+    initial_pos = _pullback_position(best["pos"], look_at, fwd_level, min_dist,
+                                     extra=PULLBACK_EXTRA_M)
+
     result = {
-        "position": [round(float(v), 4) for v in best["pos"]],
+        "position": [round(float(v), 4) for v in initial_pos],
         "look_at":  [round(float(v), 4) for v in look_at],
         "up":       [round(float(v), 4) for v in world_up],
         "source_frame": best["name"],
@@ -326,10 +395,15 @@ def run_from_transforms(frames, AT, R_dt, t_dt, scale, out_path, pin_frame, spla
 
 
 def run(sparse_dir: Path, transform: np.ndarray | None,
-        out_path: Path, pin_frame: str | None, splat_path: Path | None = None):
+        out_path: Path, pin_frame: str | None, splat_path: Path | None = None,
+        native_colmap: bool = False):
     """
     Read images.bin from sparse_dir, transform poses, pick/pin a camera,
     write initial_camera.json.
+
+    native_colmap=True: for trainers (e.g. Brush) whose output PLY lives in raw
+    COLMAP world space.  No Y/Z flip is applied to positions; forward = +col2,
+    up = -col1 (OpenCV convention: Y is down in the image).
     """
     images_bin = sparse_dir / "images.bin"
     if not images_bin.exists():
@@ -341,7 +415,7 @@ def run(sparse_dir: Path, transform: np.ndarray | None,
         print("Error: no images in images.bin", file=sys.stderr)
         sys.exit(1)
 
-    # If no transform, use identity (output is in COLMAP world / OpenGL space).
+    # If no transform, use COLMAP→OpenGL flip (safe default for most trainers).
     if transform is None:
         T = _COLMAP_TO_OPENGL
     else:
@@ -350,13 +424,21 @@ def run(sparse_dir: Path, transform: np.ndarray | None,
     # Convert each image to training/PLY space
     cameras = []
     for img in raw_images:
-        c2w_colmap  = colmap_c2w(img)      # COLMAP OpenCV c2w
-        c2w_training = T @ c2w_colmap       # in PLY/training space
+        c2w_colmap = colmap_c2w(img)      # COLMAP OpenCV c2w
 
-        pos = c2w_training[:3, 3]
-        # OpenGL convention: forward = -col2, physical up = col1
-        fwd = _normalize(-c2w_training[:3, 2])
-        up  = _normalize( c2w_training[:3, 1])
+        if native_colmap:
+            # Brush/COLMAP-native: Gaussians are in COLMAP world space.
+            # Position needs no flip; forward = +col2 (+Z into scene); up = -col1.
+            pos = c2w_colmap[:3, 3]
+            fwd = _normalize( c2w_colmap[:3, 2])   # COLMAP: +Z is into scene
+            up  = _normalize(-c2w_colmap[:3, 1])   # COLMAP: Y is down → negate
+        else:
+            c2w_training = T @ c2w_colmap           # in PLY/training space
+            pos = c2w_training[:3, 3]
+            # OpenGL convention: forward = -col2, physical up = col1
+            fwd = _normalize(-c2w_training[:3, 2])
+            up  = _normalize( c2w_training[:3, 1])
+
         cameras.append({"name": img["name"], "pos": pos, "fwd": fwd, "up": up})
 
     # Select frame
@@ -402,8 +484,26 @@ def run(sparse_dir: Path, transform: np.ndarray | None,
         look_dist = float(np.sort(bbox)[1]) * 0.5
         look_at = cam_centroid + fwd_level * look_dist
 
+    # Ensure the initial camera is far enough back to see MIN_WALL_HEIGHT_M vertically.
+    fov_y = _read_fov_y_from_cameras_txt(sparse_dir)
+    if fov_y and fov_y > 0:
+        min_dist_m = (MIN_WALL_HEIGHT_M / 2) / math.tan(fov_y / 2)
+    else:
+        min_dist_m = 2.5
+    if native_colmap:
+        # Brush: positions are in COLMAP world space ≈ metres.
+        min_dist = min_dist_m
+        extra = PULLBACK_EXTRA_M
+    else:
+        # Scale COLMAP metres → training units via the column norm of the applied transform.
+        col_scale = float(np.linalg.norm(T[:3, 0]))
+        scale = col_scale if col_scale > 1e-6 else 1.0
+        min_dist = min_dist_m * scale
+        extra = PULLBACK_EXTRA_M * scale
+    initial_pos = _pullback_position(best["pos"], look_at, fwd_level, min_dist, extra=extra)
+
     result = {
-        "position": [round(float(v), 4) for v in best["pos"]],
+        "position": [round(float(v), 4) for v in initial_pos],
         "look_at":  [round(float(v), 4) for v in look_at],
         "up":       [round(float(v), 4) for v in world_up],
         "source_frame": best["name"],
@@ -422,7 +522,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sparse",         required=True, help="Path to sparse/0 directory")
     ap.add_argument("--trainer",        default="gsplat",
-                    choices=["gsplat", "splatfacto", "pgsr", "instantsplat"],
+                    choices=["gsplat", "splatfacto", "pgsr", "instantsplat", "brush"],
                     help="Which trainer produced the PLY")
     ap.add_argument("--result-dir",     help="Trainer output dir (gsplat/pgsr: contains colmap_to_ply_transform.npy)")
     ap.add_argument("--ns-process-dir", help="Nerfstudio process dir (splatfacto: contains transforms.json)")
@@ -434,6 +534,12 @@ def main():
 
     sparse_dir = Path(args.sparse)
     out_path   = Path(args.out)
+
+    # Brush: Gaussians live in raw COLMAP world space — no flip, native poses.
+    if args.trainer == "brush":
+        splat_path = Path(args.splat) if args.splat else None
+        run(sparse_dir, None, out_path, args.frame, splat_path, native_colmap=True)
+        return
 
     # Splatfacto: use transforms.json directly (correct image names + poses)
     if args.trainer == "splatfacto":
@@ -447,7 +553,17 @@ def main():
             sys.exit(1)
         frames, AT, R_dt, t_dt, scale = result
         splat_path = Path(args.splat) if args.splat else None
-        run_from_transforms(frames, AT, R_dt, t_dt, scale, out_path, args.frame, splat_path)
+        # Read FOV from transforms.json (top-level fl_y + h)
+        fov_y_sf = None
+        try:
+            tf = json.loads((ns_process / "transforms.json").read_text())
+            fl_y = tf.get("fl_y"); h = tf.get("h")
+            if fl_y and h and fl_y > 0 and h > 0:
+                fov_y_sf = 2 * math.atan(h / (2 * fl_y))
+        except Exception:
+            pass
+        run_from_transforms(frames, AT, R_dt, t_dt, scale, out_path, args.frame,
+                            splat_path, fov_y=fov_y_sf)
         return
 
     # All other trainers: read images.bin from sparse/0
