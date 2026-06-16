@@ -495,6 +495,10 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01e_glomap_convert.log"
+
+    # Keep the feature database in the pod so query-image localization can use it later.
+    [[ -f "$DB_PATH" ]] && cp "$DB_PATH" "$MODEL_DIR/database.db"
+
 elif [[ "$SFM" == "glomap_aliked" ]]; then
     echo "[2/3] ALIKED+LightGlue features + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
     SPARSE_PARENT="$SCENE_DIR/sparse"
