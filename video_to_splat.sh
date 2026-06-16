@@ -12,6 +12,10 @@
 # Skip frame extraction (images already in assets/examples/$SCENE/images/):
 #   bash video_to_splat.sh --skip-extraction --scene NAME --iters N [options]
 #
+# Skip SfM entirely (pre-posed export: transforms.json + pointcloud.ply + images/ already present):
+#   bash video_to_splat.sh --sfm preposed --preposed-dir /path/to/export --scene NAME --iters N --trainer TRAINER
+#   (supported trainers: brush, gsplat, 2dgs, splatfacto)
+#
 # Required:
 #   --scene NAME     scene name / output folder (always required)
 #   --iters N        3DGS training iterations
@@ -51,17 +55,21 @@ SFM="mast3r"       # mast3r | fast3r | colmap_sift | glomap_sift | glomap_aliked
 TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat | onthefly | brush
 MCMC=0              # 1 = use MCMCStrategy (gsplat only); 0 = DefaultStrategy+absgrad
 GSPLAT_POST_PROCESSING=""   # "" | bilateral_grid | ppisp
+BILATERAL_GRID_FUSED=0  # 1 = use fused bilateral grid impl (requires fused_bilagrid); only with bilateral_grid
+RANDOM_BKGD=0           # 1 = randomize background color during training (helps unbounded scenes)
 GSPLAT_SSIM_LAMBDA="0.2"
 VIEWER_PORT=""      # empty = disable viewer; set to a port number to enable viser viewer
 ONTHEFLY_ITERS=30       # per-keyframe iterations for on-the-fly NVS (--sfm onthefly)
 COLMAP_BA=0
 COLMAP_MATCHER=""
+VIEW_GRAPH_CALIBRATOR=0
 NO_POINT_CAP=0
 NO_DENSIFICATION=0
 FRAMES_ONLY=0
 SKIP_EXTRACTION=0
 IMAGE_SIZE=256
 MODEL_DIR_OVERRIDE=""
+PREPOSED_DIR=""
 # Per-video lists (comma-separated, one entry per video)
 FPS_LIST=""
 NFRAMES_LIST=""
@@ -87,6 +95,8 @@ while [[ $# -gt 0 ]]; do
         --trainer)          TRAINER="$2";        shift 2 ;;
         --mcmc)             MCMC=1;              shift ;;
         --post-processing)  GSPLAT_POST_PROCESSING="$2"; shift 2 ;;
+        --bilateral-grid-fused) BILATERAL_GRID_FUSED=1; shift ;;
+        --random-bkgd)      RANDOM_BKGD=1;       shift ;;
         --ssim-lambda)      GSPLAT_SSIM_LAMBDA="$2";     shift 2 ;;
         --viewer-port)      VIEWER_PORT="$2";    shift 2 ;;
         --engine)           # deprecated: map to --sfm + --trainer
@@ -108,10 +118,12 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --colmap-ba)        COLMAP_BA=1;         shift ;;
         --colmap-matcher)   COLMAP_MATCHER="$2"; shift 2 ;;
+        --view-graph-calibrator) VIEW_GRAPH_CALIBRATOR=1; shift ;;
         --no-point-cap)      NO_POINT_CAP=1;      shift ;;
         --no-densification)  NO_DENSIFICATION=1;  shift ;;
         --image-size)   IMAGE_SIZE="$2";   shift 2 ;;
         --model-dir)    MODEL_DIR_OVERRIDE="$2"; shift 2 ;;
+        --preposed-dir) PREPOSED_DIR="$2";      shift 2 ;;
         --fps-list)     FPS_LIST="$2";     shift 2 ;;
         --nframes-list) NFRAMES_LIST="$2"; shift 2 ;;
         --start-list)   START_LIST="$2";   shift 2 ;;
@@ -139,6 +151,19 @@ USAGE="Usage:
   bash video_to_splat.sh <video> [video2 ...] --scene NAME --iters N
     --fps-list F1,F2,...   OR  --nframes-list N1,N2,...
     --start-list S1,S2,...  --duration-list D1,D2,..."
+
+# ── Preposed: validate inputs + skip extraction ───────────────────────────────
+if [[ "$SFM" == "preposed" ]]; then
+    [[ -z "$PREPOSED_DIR" ]] && { echo "Error: --sfm preposed requires --preposed-dir PATH"; exit 1; }
+    [[ ! -d "$PREPOSED_DIR" ]] && { echo "Error: --preposed-dir not found: $PREPOSED_DIR"; exit 1; }
+    [[ ! -f "$PREPOSED_DIR/transforms.json" ]] && { echo "Error: $PREPOSED_DIR/transforms.json not found"; exit 1; }
+    [[ ! -d "$PREPOSED_DIR/images" ]] && { echo "Error: $PREPOSED_DIR/images not found"; exit 1; }
+    SKIP_EXTRACTION=1
+    case "$TRAINER" in
+        brush|gsplat|2dgs|splatfacto) ;;
+        *) echo "Error: --sfm preposed does not support --trainer $TRAINER (supported: brush, gsplat, 2dgs, splatfacto)"; exit 1 ;;
+    esac
+fi
 
 [[ "$SKIP_EXTRACTION" != "1" && ${#VIDEOS[@]} -eq 0 ]] && { echo "$USAGE"; exit 1; }
 [[ -z "$SCENE" ]]          && { echo "Error: --scene is required"; echo "$USAGE"; exit 1; }
@@ -171,6 +196,12 @@ IMAGE_DIR="$SCENE_DIR/images"
 # manual runs default to the shared output_infer/$SCENE/ directory.
 MODEL_DIR="${MODEL_DIR_OVERRIDE:-$REPO/output_infer/$SCENE}"
 mkdir -p "$MODEL_DIR"
+
+# For preposed, the input dir already has transforms.json + images/ + PLY — use it directly
+if [[ "$SFM" == "preposed" ]]; then
+    SCENE_DIR="$PREPOSED_DIR"
+    IMAGE_DIR="$SCENE_DIR/images"
+fi
 
 if [[ "$SKIP_EXTRACTION" == "1" ]]; then
     # ── Skip frame extraction: images already in IMAGE_DIR ───────────────────
@@ -435,6 +466,14 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
             --SequentialMatching.overlap 10 \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_glomap_match.log"
+    fi
+
+    if [[ "$VIEW_GRAPH_CALIBRATOR" == "1" ]]; then
+        echo "    Running view_graph_calibrator (focal length estimation)..."
+        "$CONDA_BIN/colmap" view_graph_calibrator \
+            --database_path "$DB_PATH" \
+            --image_path "$IMAGE_DIR" \
+            2>&1 | tee "$MODEL_DIR/01b2_glomap_vgc.log"
     fi
 
     "$CONDA_BIN/colmap" global_mapper \
@@ -807,6 +846,23 @@ print(f'  → text→binary: {len(r.cameras)} cameras, {len(r.images)} images, {
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01c_rs_convert.log"
+elif [[ "$SFM" == "preposed" ]]; then
+    echo "[2/3] SfM skipped — converting nerfstudio poses → COLMAP sparse from $PREPOSED_DIR"
+    SPARSE_PARENT="$MODEL_DIR/sparse"
+    mkdir -p "$SPARSE_PARENT/0"
+    "$PYTHON" "$REPO/ns_to_colmap.py" \
+        "$SCENE_DIR/transforms.json" \
+        "$SPARSE_PARENT/0" \
+        2>&1 | tee "$MODEL_DIR/01_ns_to_colmap.log"
+    if [[ ! -f "$SPARSE_PARENT/0/cameras.bin" ]]; then
+        echo "Error: ns_to_colmap.py failed — check $MODEL_DIR/01_ns_to_colmap.log"
+        exit 1
+    fi
+    # Symlink images into MODEL_DIR so brush/gsplat find them when scene_dir=MODEL_DIR
+    ln -sfn "$SCENE_DIR/images" "$MODEL_DIR/images" 2>/dev/null || true
+    ln -sfn "$SCENE_DIR/images" "$MODEL_DIR/sparse/images" 2>/dev/null || true
+    # Also make sparse accessible from SCENE_DIR (needed by some trainer loaders)
+    ln -sfn "$SPARSE_PARENT" "$SCENE_DIR/sparse" 2>/dev/null || true
 elif [[ "$SFM" == "onthefly" ]]; then
     ONTHEFLY_OUT="$MODEL_DIR/onthefly_out"
     echo "[2/3] On-the-fly NVS — joint SfM+Gaussian training (${ONTHEFLY_ITERS} iters/keyframe)..."
@@ -902,6 +958,8 @@ elif [[ "$TRAINER" == "splatfacto" ]]; then
     # MASt3R/Fast3R write sparse_N/0/; classical SfM writes sparse/0/
     if [[ "$SFM" == "mast3r" || "$SFM" == "fast3r" ]]; then
         SPARSE_PARENT="$SCENE_DIR/sparse_${TOTAL_FRAMES}"
+    elif [[ "$SFM" == "preposed" ]]; then
+        SPARSE_PARENT=""
     else
         SPARSE_PARENT="$SCENE_DIR/sparse"
     fi
@@ -914,36 +972,47 @@ elif [[ "$TRAINER" == "splatfacto" ]]; then
                 2>&1 | tee -a "$MODEL_DIR/02a_ns_process.log"
         fi
     fi
-    # RS exports undistorted images; COLMAP poses are calibrated for those, not originals.
-    # Use undistorted images when present (realityscan SfM), else fall back to IMAGE_DIR.
-    NS_IMAGE_SRC="$IMAGE_DIR"
-    [[ "$SFM" == "realityscan" && -d "$SCENE_DIR/rs_output/images" ]] && \
-        NS_IMAGE_SRC="$SCENE_DIR/rs_output/images"
-    ns-process-data images \
-        --data "$NS_IMAGE_SRC" \
-        --output-dir "$NS_PROCESS_DIR" \
-        --skip-colmap \
-        --colmap-model-path "$SPARSE_PARENT/0" \
-        2>&1 | tee "$MODEL_DIR/02a_ns_process.log"
-    ns-train splatfacto \
-        --data "$NS_PROCESS_DIR" \
-        --output-dir "$NS_TRAIN_DIR" \
-        --max-num-iterations "$ITERS" \
-        --vis tensorboard \
-        2>&1 | tee "$MODEL_DIR/02_train.log"
-    # Extract initial camera from training views for the splat viewer
-    [[ -f "$NS_PROCESS_DIR/transforms.json" ]] && \
-        python3 "$REPO/camera_from_colmap.py" \
-            --sparse   "$SPARSE_PARENT/0" \
-            --trainer  splatfacto \
-            --ns-process-dir "$NS_PROCESS_DIR" \
-            --ns-train-dir   "$NS_TRAIN_DIR" \
-            --splat    "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
-            --out      "$MODEL_DIR/initial_camera.json" \
-            2>/dev/null || true
+    if [[ "$SFM" == "preposed" ]]; then
+        # transforms.json already present in SCENE_DIR — train directly
+        NS_TRAIN_DIR="$MODEL_DIR/ns_train"
+        ns-train splatfacto \
+            --data "$SCENE_DIR" \
+            --output-dir "$NS_TRAIN_DIR" \
+            --max-num-iterations "$ITERS" \
+            --vis tensorboard \
+            2>&1 | tee "$MODEL_DIR/02_train.log"
+    else
+        # RS exports undistorted images; COLMAP poses are calibrated for those, not originals.
+        # Use undistorted images when present (realityscan SfM), else fall back to IMAGE_DIR.
+        NS_IMAGE_SRC="$IMAGE_DIR"
+        [[ "$SFM" == "realityscan" && -d "$SCENE_DIR/rs_output/images" ]] && \
+            NS_IMAGE_SRC="$SCENE_DIR/rs_output/images"
+        ns-process-data images \
+            --data "$NS_IMAGE_SRC" \
+            --output-dir "$NS_PROCESS_DIR" \
+            --skip-colmap \
+            --colmap-model-path "$SPARSE_PARENT/0" \
+            2>&1 | tee "$MODEL_DIR/02a_ns_process.log"
+        ns-train splatfacto \
+            --data "$NS_PROCESS_DIR" \
+            --output-dir "$NS_TRAIN_DIR" \
+            --max-num-iterations "$ITERS" \
+            --vis tensorboard \
+            2>&1 | tee "$MODEL_DIR/02_train.log"
+        # Extract initial camera from training views for the splat viewer
+        [[ -f "$NS_PROCESS_DIR/transforms.json" ]] && \
+            python3 "$REPO/camera_from_colmap.py" \
+                --sparse   "$SPARSE_PARENT/0" \
+                --trainer  splatfacto \
+                --ns-process-dir "$NS_PROCESS_DIR" \
+                --ns-train-dir   "$NS_TRAIN_DIR" \
+                --splat    "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
+                --out      "$MODEL_DIR/initial_camera.json" \
+                2>/dev/null || true
+    fi
 elif [[ "$TRAINER" == "pgsr" ]]; then
     # For mast3r/fast3r, symlink sparse → sparse_N so sparse/0/ exists.
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     # PGSR looks for sparse/images.bin (no 0/ subdir) — symlink files up from sparse/0/
     for _f in cameras.txt images.txt points3D.txt cameras.bin images.bin points3D.bin; do
         [[ -f "$SCENE_DIR/sparse/0/$_f" ]] && \
@@ -970,11 +1039,15 @@ elif [[ "$TRAINER" == "pgsr" ]]; then
         2>/dev/null || true
 elif [[ "$TRAINER" == "gsplat" ]]; then
     # gsplat via InstantSplat/simple_trainer.py — already proven on this 8GB machine
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    # preposed: force MCMC (default strategy FPEs during densification with dense PLY init)
+    [[ "$SFM" == "preposed" ]] && MCMC=1
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames, mcmc=$MCMC, post_processing=${GSPLAT_POST_PROCESSING:-none})..."
     _GSPLAT_PP_ARGS=()
     [[ -n "$GSPLAT_POST_PROCESSING" ]] && _GSPLAT_PP_ARGS=(--post-processing "$GSPLAT_POST_PROCESSING")
+    [[ "$BILATERAL_GRID_FUSED" == "1" && "$GSPLAT_POST_PROCESSING" == "bilateral_grid" ]] && _GSPLAT_PP_ARGS+=(--bilateral-grid-fused)
+    [[ "$RANDOM_BKGD" == "1" ]] && _GSPLAT_PP_ARGS+=(--random-bkgd)
     if [[ "$MCMC" == "1" ]]; then
         # MCMCStrategy: stochastic relocation, no hard opacity resets, no runaway growth.
         # Preset "mcmc" already sets opacity_reg=0.01, scale_reg=0.01, init_opa=0.5, init_scale=0.1.
@@ -984,7 +1057,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         [[ -n "$VIEWER_PORT" ]] && _GSPLAT_VIEWER_ARGS+=("--port" "$VIEWER_PORT")
         PYTHONPATH="$REPO/../gsplat/examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "$PYTHON" "$REPO/../gsplat/examples/simple_trainer.py" mcmc \
             --data-dir "$SCENE_DIR" \
-            --data-factor 1 \
+            --data-factor "${GSPLAT_DATA_FACTOR:-1}" \
             --result-dir "$GSPLAT_OUT" \
             --max-steps "$ITERS" \
             --eval-steps "$ITERS" \
@@ -998,7 +1071,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
             --ssim-lambda "$GSPLAT_SSIM_LAMBDA" \
             "${_GSPLAT_PP_ARGS[@]}" \
             --opacity-reg 0.05 \
-            --strategy.cap-max 2000000 \
+            --strategy.cap-max "${GSPLAT_CAP_MAX:-2000000}" \
             --strategy.refine-stop-iter "$_GS_MCMC_STOP" \
             2>&1 | tee "$MODEL_DIR/02_train.log"
     else
@@ -1010,7 +1083,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         [[ -n "$VIEWER_PORT" ]] && _GSPLAT_VIEWER_ARGS+=("--port" "$VIEWER_PORT")
         PYTHONPATH="$REPO/../gsplat/examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/../gsplat/examples/simple_trainer.py" default \
             --data-dir "$SCENE_DIR" \
-            --data-factor 1 \
+            --data-factor "${GSPLAT_DATA_FACTOR:-1}" \
             --result-dir "$GSPLAT_OUT" \
             --max-steps "$ITERS" \
             --eval-steps "$ITERS" \
@@ -1041,7 +1114,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         --out        "$MODEL_DIR/initial_camera.json" \
         2>/dev/null || true
 elif [[ "$TRAINER" == "2dgs" ]]; then
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     _GS_REFINE_STOP=$(( ITERS / 2 ))
     echo "[2/3] 2DGS training ($ITERS iterations, $TOTAL_FRAMES frames)..."
@@ -1071,16 +1144,22 @@ elif [[ "$TRAINER" == "2dgs" ]]; then
         2>/dev/null || true
 elif [[ "$TRAINER" == "brush" ]]; then
     # Brush: Rust-based MCMC-style trainer; headless by default (no --with-viewer).
-    # Accepts COLMAP format: scene_dir must have images/ and sparse/0/.
+    # Accepts COLMAP or nerfstudio format (auto-detected from scene_dir).
     [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && \
        "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && \
-       "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" ]] && \
+       "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && \
+       "$SFM" != "preposed" ]] && \
         ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     BRUSH_BIN="${BRUSH_BIN:-/home/communications/workdir/brush/brush-app-x86_64-unknown-linux-gnu/brush_app}"
     BRUSH_OUT="$MODEL_DIR/brush_output"
     mkdir -p "$BRUSH_OUT"
+    # For preposed: pass MODEL_DIR (has sparse/ but NOT transforms.json) so brush
+    # uses its COLMAP loader instead of the nerfstudio loader (which ignores our
+    # coordinate-corrected COLMAP sparse and loads the original PLY instead)
+    _BRUSH_SCENE="$SCENE_DIR"
+    [[ "$SFM" == "preposed" ]] && _BRUSH_SCENE="$MODEL_DIR"
     echo "[2/3] Brush training ($ITERS iterations, $TOTAL_FRAMES frames)..."
-    RUST_LOG=brush_cli=info "$BRUSH_BIN" "$SCENE_DIR" \
+    RUST_LOG=brush_cli=info "$BRUSH_BIN" "$_BRUSH_SCENE" \
         --total-steps "$ITERS" \
         --export-path "$BRUSH_OUT" \
         --export-every "$ITERS" \
