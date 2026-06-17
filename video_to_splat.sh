@@ -496,15 +496,12 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01e_glomap_convert.log"
 
-    # Persist database for query-image localization.
-    # 1. Remap image IDs to match sparse model (GLOMAP reassigns them vs feature_extractor).
-    # 2. Expand images.txt to full COLMAP format (GLOMAP only stores matched keypoints;
-    #    image_registrator requires ALL keypoints listed with -1 for unmatched ones).
+    # Persist remapped database for query-image localization.
+    # GLOMAP reassigns image IDs vs the feature_extractor DB; remap so
+    # localize_colmap.sh can match DB images to the sparse model by ID.
     if [[ -f "$DB_PATH" && -f "$SPARSE_PARENT/0/images.txt" ]]; then
         python3 "$REPO/remap_db_to_sparse.py" \
             "$DB_PATH" "$SPARSE_PARENT/0/images.txt" "$MODEL_DIR/database.db"
-        python3 "$REPO/expand_glomap_images.py" \
-            "$MODEL_DIR/database.db" "$SPARSE_PARENT/0" --in-place
     fi
 
 elif [[ "$SFM" == "glomap_aliked" ]]; then
