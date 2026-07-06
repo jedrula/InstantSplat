@@ -53,6 +53,9 @@ SPARSE_PAIRS=0
 SPARSE_GA=0
 SFM="mast3r"       # mast3r | fast3r | colmap_sift | glomap_sift | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | colmap_aliked | fastmap | realityscan | onthefly
 TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat | onthefly | brush
+LANGSPLAT=0         # 1 = run LangSplat pipeline after training
+LANGSPLAT_ITERS=3000
+LANGSPLAT_AE_EPOCHS=30
 MCMC=0              # 1 = use MCMCStrategy (gsplat only); 0 = DefaultStrategy+absgrad
 GSPLAT_POST_PROCESSING=""   # "" | bilateral_grid | ppisp
 BILATERAL_GRID_FUSED=0  # 1 = use fused bilateral grid impl (requires fused_bilagrid); only with bilateral_grid
@@ -128,6 +131,11 @@ while [[ $# -gt 0 ]]; do
         --nframes-list) NFRAMES_LIST="$2"; shift 2 ;;
         --start-list)   START_LIST="$2";   shift 2 ;;
         --duration-list) DURATION_LIST="$2"; shift 2 ;;
+        --lang)         LANGSPLAT=1;       shift ;;
+        --lang-iters)   LANGSPLAT_ITERS="$2"; shift 2 ;;
+        --lang-ae-epochs) LANGSPLAT_AE_EPOCHS="$2"; shift 2 ;;
+        --brush-extra-args) BRUSH_EXTRA_ARGS="$2"; shift 2 ;;
+        --skip-sfm)     SKIP_SFM=1;        shift ;;
         -*)             echo "Unknown option: $1"; exit 1 ;;
         *)              VIDEOS+=("$1"); shift ;;
     esac
@@ -164,6 +172,17 @@ if [[ "$SFM" == "preposed" ]]; then
         *) echo "Error: --sfm preposed does not support --trainer $TRAINER (supported: brush, gsplat, 2dgs, splatfacto)"; exit 1 ;;
     esac
 fi
+if [[ "$SFM" == "preposed_colmap" ]]; then
+    [[ -z "$PREPOSED_DIR" ]] && { echo "Error: --sfm preposed_colmap requires --preposed-dir PATH"; exit 1; }
+    [[ ! -d "$PREPOSED_DIR" ]] && { echo "Error: --preposed-dir not found: $PREPOSED_DIR"; exit 1; }
+    [[ ! -f "$PREPOSED_DIR/sparse/0/cameras.bin" ]] && { echo "Error: $PREPOSED_DIR/sparse/0/cameras.bin not found"; exit 1; }
+    [[ ! -d "$PREPOSED_DIR/images" ]] && { echo "Error: $PREPOSED_DIR/images not found"; exit 1; }
+    SKIP_EXTRACTION=1
+    case "$TRAINER" in
+        brush|gsplat|2dgs|splatfacto) ;;
+        *) echo "Error: --sfm preposed_colmap does not support --trainer $TRAINER (supported: brush, gsplat, 2dgs, splatfacto)"; exit 1 ;;
+    esac
+fi
 
 [[ "$SKIP_EXTRACTION" != "1" && ${#VIDEOS[@]} -eq 0 ]] && { echo "$USAGE"; exit 1; }
 [[ -z "$SCENE" ]]          && { echo "Error: --scene is required"; echo "$USAGE"; exit 1; }
@@ -197,8 +216,8 @@ IMAGE_DIR="$SCENE_DIR/images"
 MODEL_DIR="${MODEL_DIR_OVERRIDE:-$REPO/output_infer/$SCENE}"
 mkdir -p "$MODEL_DIR"
 
-# For preposed, the input dir already has transforms.json + images/ + PLY — use it directly
-if [[ "$SFM" == "preposed" ]]; then
+# For preposed*, the input dir already has images/ — use it directly
+if [[ "$SFM" == "preposed" || "$SFM" == "preposed_colmap" ]]; then
     SCENE_DIR="$PREPOSED_DIR"
     IMAGE_DIR="$SCENE_DIR/images"
 fi
@@ -351,15 +370,17 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     SPARSE_PARENT="$SCENE_DIR/sparse"
     rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
     rm -f "$DB_PATH"
-    # /usr/bin/colmap is a Qt GUI binary — needs offscreen platform in headless env
     export QT_QPA_PLATFORM=offscreen
 
-    /usr/bin/colmap feature_extractor \
+    # Use conda COLMAP 4.x throughout: GPU SIFT + matching, and the same DB
+    # schema for the incremental mapper (mixing /usr/bin/colmap 3.9 broke GPU).
+    "$CONDA_BIN/colmap" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model PINHOLE \
         --ImageReader.single_camera 1 \
-        --SiftExtraction.use_gpu 0 \
+        --FeatureExtraction.use_gpu 1 \
+        --FeatureExtraction.max_image_size 1600 \
         2>&1 | tee "$MODEL_DIR/01a_colmap_features.log"
 
     # Resolve matcher: explicit flag > auto (exhaustive ≤50 frames, sequential >50)
@@ -369,31 +390,32 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     fi
     echo "    Matcher: $_MATCHER"
     if [[ "$_MATCHER" == "exhaustive" ]]; then
-        /usr/bin/colmap exhaustive_matcher \
+        "$CONDA_BIN/colmap" exhaustive_matcher \
             --database_path "$DB_PATH" \
-            --SiftMatching.use_gpu 0 \
+            --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_colmap_match.log"
     elif [[ "$_MATCHER" == "vocab_tree" ]]; then
-        VOCAB_TREE="$REPO/assets/vocab_tree_flickr100K_words32K.bin"
+        # COLMAP 4.x uses faiss (not flann) — needs the faiss-format tree
+        VOCAB_TREE="$REPO/assets/vocab_tree_faiss_flickr100K_words256K.bin"
         if [[ ! -f "$VOCAB_TREE" ]]; then
             echo "Error: vocab tree not found at $VOCAB_TREE"
-            echo "Download with: wget -O $VOCAB_TREE https://demuc.de/colmap/vocab_tree_flickr100K_words32K.bin"
+            echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
             exit 1
         fi
-        /usr/bin/colmap vocab_tree_matcher \
+        "$CONDA_BIN/colmap" vocab_tree_matcher \
             --database_path "$DB_PATH" \
             --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
-            --SiftMatching.use_gpu 0 \
+            --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_colmap_match.log"
     else
-        /usr/bin/colmap sequential_matcher \
+        "$CONDA_BIN/colmap" sequential_matcher \
             --database_path "$DB_PATH" \
             --SequentialMatching.overlap 10 \
-            --SiftMatching.use_gpu 0 \
+            --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_colmap_match.log"
     fi
 
-    /usr/bin/colmap mapper \
+    "$CONDA_BIN/colmap" mapper \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --output_path "$SPARSE_PARENT" \
@@ -412,7 +434,7 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_colmap_filter.log"
 
     # Convert binary → text (cameras.txt, images.txt, points3D.txt) for train.py
-    /usr/bin/colmap model_converter \
+    "$CONDA_BIN/colmap" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
@@ -472,7 +494,6 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
         echo "    Running view_graph_calibrator (focal length estimation)..."
         "$CONDA_BIN/colmap" view_graph_calibrator \
             --database_path "$DB_PATH" \
-            --image_path "$IMAGE_DIR" \
             2>&1 | tee "$MODEL_DIR/01b2_glomap_vgc.log"
     fi
 
@@ -872,6 +893,14 @@ elif [[ "$SFM" == "preposed" ]]; then
     ln -sfn "$SCENE_DIR/images" "$MODEL_DIR/sparse/images" 2>/dev/null || true
     # Also make sparse accessible from SCENE_DIR (needed by some trainer loaders)
     ln -sfn "$SPARSE_PARENT" "$SCENE_DIR/sparse" 2>/dev/null || true
+elif [[ "$SFM" == "preposed_colmap" ]]; then
+    echo "[SfM] Reusing COLMAP sparse from $PREPOSED_DIR/sparse/0"
+    SPARSE_PARENT="$MODEL_DIR/sparse"
+    mkdir -p "$SPARSE_PARENT"
+    ln -sfn "$PREPOSED_DIR/sparse/0" "$SPARSE_PARENT/0"
+    ln -sfn "$SCENE_DIR/images" "$MODEL_DIR/images" 2>/dev/null || true
+    ln -sfn "$SCENE_DIR/images" "$MODEL_DIR/sparse/images" 2>/dev/null || true
+    ln -sfn "$SPARSE_PARENT" "$SCENE_DIR/sparse" 2>/dev/null || true
 elif [[ "$SFM" == "onthefly" ]]; then
     ONTHEFLY_OUT="$MODEL_DIR/onthefly_out"
     echo "[2/3] On-the-fly NVS — joint SfM+Gaussian training (${ONTHEFLY_ITERS} iters/keyframe)..."
@@ -1021,7 +1050,7 @@ elif [[ "$TRAINER" == "splatfacto" ]]; then
     fi
 elif [[ "$TRAINER" == "pgsr" ]]; then
     # For mast3r/fast3r, symlink sparse → sparse_N so sparse/0/ exists.
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     # PGSR looks for sparse/images.bin (no 0/ subdir) — symlink files up from sparse/0/
     for _f in cameras.txt images.txt points3D.txt cameras.bin images.bin points3D.bin; do
         [[ -f "$SCENE_DIR/sparse/0/$_f" ]] && \
@@ -1049,8 +1078,8 @@ elif [[ "$TRAINER" == "pgsr" ]]; then
 elif [[ "$TRAINER" == "gsplat" ]]; then
     # gsplat via InstantSplat/simple_trainer.py — already proven on this 8GB machine
     # preposed: force MCMC (default strategy FPEs during densification with dense PLY init)
-    [[ "$SFM" == "preposed" ]] && MCMC=1
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" == "preposed" || "$SFM" == "preposed_colmap" ]] && MCMC=1
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames, mcmc=$MCMC, post_processing=${GSPLAT_POST_PROCESSING:-none})..."
     _GSPLAT_PP_ARGS=()
@@ -1123,7 +1152,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         --out        "$MODEL_DIR/initial_camera.json" \
         2>/dev/null || true
 elif [[ "$TRAINER" == "2dgs" ]]; then
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     _GS_REFINE_STOP=$(( ITERS / 2 ))
     echo "[2/3] 2DGS training ($ITERS iterations, $TOTAL_FRAMES frames)..."
@@ -1157,7 +1186,7 @@ elif [[ "$TRAINER" == "brush" ]]; then
     [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && \
        "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && \
        "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && \
-       "$SFM" != "preposed" ]] && \
+       "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && \
         ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     BRUSH_BIN="${BRUSH_BIN:-/home/communications/workdir/brush/brush-app-x86_64-unknown-linux-gnu/brush_app}"
     BRUSH_OUT="$MODEL_DIR/brush_output"
@@ -1166,13 +1195,17 @@ elif [[ "$TRAINER" == "brush" ]]; then
     # uses its COLMAP loader instead of the nerfstudio loader (which ignores our
     # coordinate-corrected COLMAP sparse and loads the original PLY instead)
     _BRUSH_SCENE="$SCENE_DIR"
-    [[ "$SFM" == "preposed" ]] && _BRUSH_SCENE="$MODEL_DIR"
+    [[ "$SFM" == "preposed" || "$SFM" == "preposed_colmap" ]] && _BRUSH_SCENE="$MODEL_DIR"
     echo "[2/3] Brush training ($ITERS iterations, $TOTAL_FRAMES frames)..."
+    # BRUSH_EXTRA_ARGS: space-separated additional flags passed through --brush-extra-args
+    _BRUSH_EXTRA=()
+    [[ -n "${BRUSH_EXTRA_ARGS:-}" ]] && read -ra _BRUSH_EXTRA <<< "$BRUSH_EXTRA_ARGS"
     RUST_LOG=brush_cli=info "$BRUSH_BIN" "$_BRUSH_SCENE" \
         --total-steps "$ITERS" \
         --export-path "$BRUSH_OUT" \
         --export-every "$ITERS" \
         --eval-split-every 8 \
+        "${_BRUSH_EXTRA[@]}" \
         2>&1 | tee "$MODEL_DIR/02_train.log"
     SPARSE_PARENT="$SCENE_DIR/sparse"
     python3 "$REPO/camera_from_colmap.py" \
@@ -1296,6 +1329,22 @@ cat > "$PARAMS_FILE" <<EOF
   "timestamp":        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 EOF
+
+# ── Optional: LangSplat pipeline ─────────────────────────────────────────────
+if [[ "$LANGSPLAT" == "1" ]]; then
+    echo ""
+    echo "[LangSplat] Running language feature pipeline..."
+    LANG_OUT="$MODEL_DIR/langsplat"
+    bash "$REPO/run_langsplat.sh" \
+        --ply        "$PLY" \
+        --scene-dir  "$SCENE_DIR" \
+        --image-dir  "$IMAGE_DIR" \
+        --output-dir "$LANG_OUT" \
+        --iters      "$LANGSPLAT_ITERS" \
+        --ae-epochs  "$LANGSPLAT_AE_EPOCHS" \
+        2>&1 | tee "$MODEL_DIR/langsplat.log"
+    emit_event "{\"event\":\"langsplat_done\",\"lang_ply\":\"$LANG_OUT/lang_gaussians.ply\"}"
+fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
