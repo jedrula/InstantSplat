@@ -51,7 +51,7 @@ SMART_FRAMES=0
 SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
-SFM="mast3r"       # mast3r | fast3r | colmap_sift | glomap_sift | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | colmap_aliked | fastmap | realityscan | onthefly
+SFM="mast3r"       # mast3r | fast3r | colmap_sift | glomap_sift | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | glomap_dedode | colmap_aliked | fastmap | realityscan | onthefly
 TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat | onthefly | brush
 LANGSPLAT=0         # 1 = run LangSplat pipeline after training
 LANGSPLAT_ITERS=3000
@@ -65,6 +65,7 @@ VIEWER_PORT=""      # empty = disable viewer; set to a port number to enable vis
 ONTHEFLY_ITERS=30       # per-keyframe iterations for on-the-fly NVS (--sfm onthefly)
 COLMAP_BA=0
 COLMAP_MATCHER=""
+CAMERA_MODEL="PINHOLE"   # PINHOLE | SIMPLE_RADIAL | RADIAL | OPENCV — non-PINHOLE triggers undistortion after SfM
 VIEW_GRAPH_CALIBRATOR=0
 NO_POINT_CAP=0
 NO_DENSIFICATION=0
@@ -112,6 +113,7 @@ while [[ $# -gt 0 ]]; do
                 glomap_disk)  SFM="glomap_disk";  TRAINER="instantsplat" ;;
                 glomap_superpoint)    SFM="glomap_superpoint";    TRAINER="instantsplat" ;;
                 glomap_loftr) SFM="glomap_loftr"; TRAINER="instantsplat" ;;
+                glomap_dedode) SFM="glomap_dedode"; TRAINER="instantsplat" ;;
                 colmap_aliked)    SFM="colmap_aliked";    TRAINER="instantsplat" ;;
                 fastmap)      SFM="fastmap";      TRAINER="instantsplat" ;;
                 realityscan)  SFM="realityscan"; TRAINER="instantsplat" ;;
@@ -121,6 +123,7 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --colmap-ba)        COLMAP_BA=1;         shift ;;
         --colmap-matcher)   COLMAP_MATCHER="$2"; shift 2 ;;
+        --camera-model)     CAMERA_MODEL="$2"; shift 2 ;;
         --view-graph-calibrator) VIEW_GRAPH_CALIBRATOR=1; shift ;;
         --no-point-cap)      NO_POINT_CAP=1;      shift ;;
         --no-densification)  NO_DENSIFICATION=1;  shift ;;
@@ -228,7 +231,7 @@ if [[ "$SKIP_EXTRACTION" == "1" ]]; then
         echo "Error: --skip-extraction requires images already in $IMAGE_DIR"
         exit 1
     fi
-    TOTAL_FRAMES=$(ls "$IMAGE_DIR" 2>/dev/null | grep -cE '\.(jpg|jpeg|png|webp)$' || true)
+    TOTAL_FRAMES=$(ls "$IMAGE_DIR" 2>/dev/null | grep -ciE '\.(jpg|jpeg|png|webp)$' || true)
     if [[ "$TOTAL_FRAMES" -lt 2 ]]; then
         echo "Error: need at least 2 images in $IMAGE_DIR (found $TOTAL_FRAMES)"
         exit 1
@@ -374,10 +377,11 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
 
     # Use conda COLMAP 4.x throughout: GPU SIFT + matching, and the same DB
     # schema for the incremental mapper (mixing /usr/bin/colmap 3.9 broke GPU).
+    echo "    Camera model: $CAMERA_MODEL"
     "$CONDA_BIN/colmap" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
-        --ImageReader.camera_model PINHOLE \
+        --ImageReader.camera_model "$CAMERA_MODEL" \
         --ImageReader.single_camera 1 \
         --FeatureExtraction.use_gpu 1 \
         --FeatureExtraction.max_image_size 1600 \
@@ -386,7 +390,10 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     # Resolve matcher: explicit flag > auto (exhaustive ≤50 frames, sequential >50)
     _MATCHER="${COLMAP_MATCHER}"
     if [[ -z "$_MATCHER" ]]; then
-        (( TOTAL_FRAMES <= 50 )) && _MATCHER="exhaustive" || _MATCHER="sequential"
+        # NEVER fall back to bare sequential: no loop closure starves the view graph on
+        # non-sequential/revisiting captures -> GLOMAP global scale-drift/fold (playroom
+        # 2026-07-25, experiments/glomap_vs_reference_playroom/FINDINGS.md).
+        if (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
     fi
     echo "    Matcher: $_MATCHER"
     if [[ "$_MATCHER" == "exhaustive" ]]; then
@@ -427,11 +434,59 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     fi
 
     N_COMPONENTS=$(ls -d "$SPARSE_PARENT"/[0-9]* 2>/dev/null | wc -l)
-    (( N_COMPONENTS > 1 )) && echo "    ⚠  $N_COMPONENTS disconnected components — using component 0 (largest)"
+    if (( N_COMPONENTS > 1 )); then
+        # COLMAP numbers components in creation order, NOT by size — a tiny
+        # abandoned false-start can be 0 while the real model is 1 (seen in
+        # pod 766f09cd: sparse/0 had 4 images, sparse/1 had all 311).
+        # Pick the component with the most registered images.
+        BEST_COMP=$("$PYTHON" - "$SPARSE_PARENT" <<'PYCOMP'
+import sys, pycolmap
+from pathlib import Path
+parent = Path(sys.argv[1])
+best, best_n = "0", -1
+for d in sorted(parent.iterdir()):
+    if not d.is_dir() or not d.name.isdigit():
+        continue
+    try:
+        n = len(pycolmap.Reconstruction(str(d)).images)
+    except Exception:
+        n = -1
+    if n > best_n:
+        best, best_n = d.name, n
+print(best)
+PYCOMP
+)
+        echo "    ⚠  $N_COMPONENTS disconnected components — largest is $BEST_COMP"
+        if [[ "$BEST_COMP" != "0" ]]; then
+            mv "$SPARSE_PARENT/0" "$SPARSE_PARENT/0_small"
+            mv "$SPARSE_PARENT/$BEST_COMP" "$SPARSE_PARENT/0"
+        fi
+    fi
 
     # Outlier filter (needs binary reconstruction; works before text conversion)
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_colmap_filter.log"
+
+    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then
+        echo "    Undistorting images ($CAMERA_MODEL → PINHOLE)..."
+        UNDIST_DIR="$SCENE_DIR/undistorted"
+        rm -rf "$UNDIST_DIR"
+        "$CONDA_BIN/colmap" image_undistorter \
+            --image_path "$IMAGE_DIR" \
+            --input_path "$SPARSE_PARENT/0" \
+            --output_path "$UNDIST_DIR" \
+            --output_type COLMAP \
+            2>&1 | tee "$MODEL_DIR/01d2_undistort.log"
+        [[ -f "$UNDIST_DIR/sparse/cameras.bin" ]] || { echo "Error: image_undistorter failed. Check $MODEL_DIR/01d2_undistort.log"; exit 1; }
+        # Swap scene to undistorted: pinhole sparse + undistorted images (trainers see a plain PINHOLE scene)
+        rm -rf "$SCENE_DIR/images_distorted"
+        mv "$IMAGE_DIR" "$SCENE_DIR/images_distorted"
+        mv "$UNDIST_DIR/images" "$IMAGE_DIR"
+        rm -rf "$SPARSE_PARENT/0"
+        mkdir -p "$SPARSE_PARENT/0"
+        mv "$UNDIST_DIR"/sparse/* "$SPARSE_PARENT/0/"
+        rm -rf "$UNDIST_DIR"
+    fi
 
     # Convert binary → text (cameras.txt, images.txt, points3D.txt) for train.py
     "$CONDA_BIN/colmap" model_converter \
@@ -450,10 +505,11 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
     # GLOMAP is deprecated upstream; its global mapper is now part of COLMAP 4.x.
     # Use $CONDA_BIN/colmap throughout so features, matching, and global_mapper
     # all share the same DB schema — no version mismatch, retriangulation works.
+    echo "    Camera model: $CAMERA_MODEL"
     "$CONDA_BIN/colmap" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
-        --ImageReader.camera_model PINHOLE \
+        --ImageReader.camera_model "$CAMERA_MODEL" \
         --ImageReader.single_camera 1 \
         --FeatureExtraction.use_gpu 1 \
         --FeatureExtraction.max_image_size 1600 \
@@ -461,7 +517,10 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
 
     _MATCHER="${COLMAP_MATCHER}"
     if [[ -z "$_MATCHER" ]]; then
-        (( TOTAL_FRAMES <= 50 )) && _MATCHER="exhaustive" || _MATCHER="sequential"
+        # NEVER fall back to bare sequential: no loop closure starves the view graph on
+        # non-sequential/revisiting captures -> GLOMAP global scale-drift/fold (playroom
+        # 2026-07-25, experiments/glomap_vs_reference_playroom/FINDINGS.md).
+        if (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
     fi
     echo "    Matcher: $_MATCHER"
     if [[ "$_MATCHER" == "exhaustive" ]]; then
@@ -508,8 +567,58 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
         exit 1
     fi
 
+    # global_mapper can emit multiple disconnected components numbered in creation
+    # order (not by size) — sparse/0 may be a tiny false-start. Pick the largest by
+    # registered-image count (mirrors the colmap_sift branch; 2026-07-26).
+    N_COMPONENTS=$(ls -d "$SPARSE_PARENT"/[0-9]* 2>/dev/null | wc -l)
+    if (( N_COMPONENTS > 1 )); then
+        BEST_COMP=$("$PYTHON" - "$SPARSE_PARENT" <<'PYCOMP'
+import sys, pycolmap
+from pathlib import Path
+parent = Path(sys.argv[1])
+best, best_n = "0", -1
+for d in sorted(parent.iterdir()):
+    if not d.is_dir() or not d.name.isdigit():
+        continue
+    try:
+        n = len(pycolmap.Reconstruction(str(d)).images)
+    except Exception:
+        n = -1
+    if n > best_n:
+        best, best_n = d.name, n
+print(best)
+PYCOMP
+)
+        echo "    ⚠  $N_COMPONENTS disconnected components — largest is $BEST_COMP"
+        if [[ "$BEST_COMP" != "0" ]]; then
+            mv "$SPARSE_PARENT/0" "$SPARSE_PARENT/0_small"
+            mv "$SPARSE_PARENT/$BEST_COMP" "$SPARSE_PARENT/0"
+        fi
+    fi
+
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_glomap_filter.log"
+
+    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then
+        echo "    Undistorting images ($CAMERA_MODEL → PINHOLE)..."
+        UNDIST_DIR="$SCENE_DIR/undistorted"
+        rm -rf "$UNDIST_DIR"
+        "$CONDA_BIN/colmap" image_undistorter \
+            --image_path "$IMAGE_DIR" \
+            --input_path "$SPARSE_PARENT/0" \
+            --output_path "$UNDIST_DIR" \
+            --output_type COLMAP \
+            2>&1 | tee "$MODEL_DIR/01d2_undistort.log"
+        [[ -f "$UNDIST_DIR/sparse/cameras.bin" ]] || { echo "Error: image_undistorter failed. Check $MODEL_DIR/01d2_undistort.log"; exit 1; }
+        # Swap scene to undistorted: pinhole sparse + undistorted images (trainers see a plain PINHOLE scene)
+        rm -rf "$SCENE_DIR/images_distorted"
+        mv "$IMAGE_DIR" "$SCENE_DIR/images_distorted"
+        mv "$UNDIST_DIR/images" "$IMAGE_DIR"
+        rm -rf "$SPARSE_PARENT/0"
+        mkdir -p "$SPARSE_PARENT/0"
+        mv "$UNDIST_DIR"/sparse/* "$SPARSE_PARENT/0/"
+        rm -rf "$UNDIST_DIR"
+    fi
 
     "$CONDA_BIN/colmap" model_converter \
         --input_path "$SPARSE_PARENT/0" \
@@ -530,6 +639,7 @@ elif [[ "$SFM" == "glomap_aliked" ]]; then
     SPARSE_PARENT="$SCENE_DIR/sparse"
     rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
     HLOC_WORK="$SCENE_DIR/hloc_work"
+    DB_PATH="$HLOC_WORK/database.db"   # hloc db; image IDs already match sparse/0 (no remap needed)
     rm -rf "$HLOC_WORK"
 
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/glomap_hloc.py" \
@@ -559,6 +669,7 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
     SPARSE_PARENT="$SCENE_DIR/sparse"
     rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
     HLOC_WORK="$SCENE_DIR/hloc_work"
+    DB_PATH="$HLOC_WORK/database.db"   # hloc db; image IDs already match sparse/0 (no remap needed)
     rm -rf "$HLOC_WORK"
 
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/glomap_hloc.py" \
@@ -583,6 +694,44 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01c_glomap_loftr_convert.log"
+elif [[ "$SFM" == "glomap_dedode" ]]; then
+    echo "[2/3] DeDoDe detect+describe + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
+    SPARSE_PARENT="$SCENE_DIR/sparse"
+    rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
+    HLOC_WORK="$SCENE_DIR/hloc_work"
+    DB_PATH="$HLOC_WORK/database.db"   # image IDs already match sparse/0 (no remap needed)
+    rm -rf "$HLOC_WORK"
+
+    # Focal length prior from previous reconstruction if available (fixes GLOMAP warning)
+    _FL_ARG=""
+    _PREV_TF=$(find "$SCENE_DIR" -name "transforms.json" 2>/dev/null | head -1)
+    if [[ -n "$_PREV_TF" ]]; then
+        _FL=$(python3 -c "import json; d=json.load(open('$_PREV_TF')); print(d.get('fl_x',''))" 2>/dev/null || true)
+        [[ -n "$_FL" ]] && _FL_ARG="--focal-length $_FL"
+    fi
+
+    CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/glomap_dedode.py" \
+        "$IMAGE_DIR" \
+        "$HLOC_WORK" \
+        $_FL_ARG \
+        --colmap-bin "$CONDA_BIN/colmap" \
+        2>&1 | tee "$MODEL_DIR/01_glomap_dedode.log"
+
+    if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
+        echo "Error: glomap_dedode produced no reconstruction. Check $MODEL_DIR/01_glomap_dedode.log"
+        exit 1
+    fi
+
+    mv "$HLOC_WORK/sparse/0" "$SPARSE_PARENT/0"
+
+    SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
+        "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_dedode_filter.log"
+
+    "$CONDA_BIN/colmap" model_converter \
+        --input_path "$SPARSE_PARENT/0" \
+        --output_path "$SPARSE_PARENT/0" \
+        --output_type TXT \
+        2>&1 | tee "$MODEL_DIR/01c_glomap_dedode_convert.log"
 elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" ]]; then
     case "$SFM" in
         glomap_disk) _MATCHER="disk+lightglue";       _MAPPER="glomap" ;;
@@ -593,6 +742,7 @@ elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "c
     SPARSE_PARENT="$SCENE_DIR/sparse"
     rm -rf "$SPARSE_PARENT" && mkdir -p "$SPARSE_PARENT"
     HLOC_WORK="$SCENE_DIR/hloc_work"
+    DB_PATH="$HLOC_WORK/database.db"   # hloc db; image IDs already match sparse/0 (no remap needed)
     rm -rf "$HLOC_WORK"
 
     # Focal length prior from previous reconstruction if available (fixes GLOMAP warning)
@@ -648,7 +798,10 @@ elif [[ "$SFM" == "fastmap" ]]; then
 
     _MATCHER="${COLMAP_MATCHER}"
     if [[ -z "$_MATCHER" ]]; then
-        (( TOTAL_FRAMES <= 50 )) && _MATCHER="exhaustive" || _MATCHER="sequential"
+        # NEVER fall back to bare sequential: no loop closure starves the view graph on
+        # non-sequential/revisiting captures -> GLOMAP global scale-drift/fold (playroom
+        # 2026-07-25, experiments/glomap_vs_reference_playroom/FINDINGS.md).
+        if (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
     fi
     echo "    Matcher: $_MATCHER"
     if [[ "$_MATCHER" == "exhaustive" ]]; then
@@ -934,7 +1087,7 @@ else
         2>&1 | tee "$MODEL_DIR/01_init_geo.log"
 fi
 # Export sparse point cloud as PLY for browser preview
-if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
     _PC_SRC="$SCENE_DIR/sparse/0"
 else
     _PC_SRC="$SCENE_DIR/sparse_${TOTAL_FRAMES}/0"
@@ -948,10 +1101,14 @@ fi
 
 # Copy COLMAP sparse into pod so it is self-contained for LichtFeld / re-training
 if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || \
-      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
+      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
       "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
     if [[ -d "$SPARSE_PARENT" ]]; then
         cp -r "$SPARSE_PARENT" "$MODEL_DIR/"
+        # Copy the COLMAP feature/match database so the pod is a complete COLMAP
+        # project (needed for the /history colmap-dataset download, localization,
+        # re-matching). Don't clobber the glomap path's remapped $MODEL_DIR/database.db.
+        [[ -f "$DB_PATH" && ! -f "$MODEL_DIR/database.db" ]] && cp "$DB_PATH" "$MODEL_DIR/database.db"
         # Thin colmap/ dir so LichtFeld can load without hitting the meta.json SOG check
         mkdir -p "$MODEL_DIR/colmap"
         ln -sfn ../sparse "$MODEL_DIR/colmap/sparse"
@@ -1050,7 +1207,7 @@ elif [[ "$TRAINER" == "splatfacto" ]]; then
     fi
 elif [[ "$TRAINER" == "pgsr" ]]; then
     # For mast3r/fast3r, symlink sparse → sparse_N so sparse/0/ exists.
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     # PGSR looks for sparse/images.bin (no 0/ subdir) — symlink files up from sparse/0/
     for _f in cameras.txt images.txt points3D.txt cameras.bin images.bin points3D.bin; do
         [[ -f "$SCENE_DIR/sparse/0/$_f" ]] && \
@@ -1079,7 +1236,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
     # gsplat via InstantSplat/simple_trainer.py — already proven on this 8GB machine
     # preposed: force MCMC (default strategy FPEs during densification with dense PLY init)
     [[ "$SFM" == "preposed" || "$SFM" == "preposed_colmap" ]] && MCMC=1
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames, mcmc=$MCMC, post_processing=${GSPLAT_POST_PROCESSING:-none})..."
     _GSPLAT_PP_ARGS=()
@@ -1152,7 +1309,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         --out        "$MODEL_DIR/initial_camera.json" \
         2>/dev/null || true
 elif [[ "$TRAINER" == "2dgs" ]]; then
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     _GS_REFINE_STOP=$(( ITERS / 2 ))
     echo "[2/3] 2DGS training ($ITERS iterations, $TOTAL_FRAMES frames)..."
@@ -1184,7 +1341,7 @@ elif [[ "$TRAINER" == "brush" ]]; then
     # Brush: Rust-based MCMC-style trainer; headless by default (no --with-viewer).
     # Accepts COLMAP or nerfstudio format (auto-detected from scene_dir).
     [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && \
-       "$SFM" != "glomap_loftr" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && \
+       "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && \
        "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && \
        "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && \
         ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
@@ -1219,10 +1376,10 @@ else
     # instantsplat trainer
     # train.py looks for sparse_{N}/0/ — COLMAP/GLOMAP/FastMap write sparse/0/ instead;
     # symlink sparse_N → sparse so the scene loader finds it.
-    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && ln -sfn "sparse" "$SCENE_DIR/sparse_${TOTAL_FRAMES}" 2>/dev/null || true
+    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && ln -sfn "sparse" "$SCENE_DIR/sparse_${TOTAL_FRAMES}" 2>/dev/null || true
     # --pp_optimizer requires confidence_dsp.npy from init_geo.py (MASt3R/Fast3R only)
     PP_OPT_ARG="--pp_optimizer"
-    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && PP_OPT_ARG=""
+    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && PP_OPT_ARG=""
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
         -s "$SCENE_DIR" \
         -m "$MODEL_DIR" \
@@ -1350,7 +1507,7 @@ fi
 echo ""
 # Remove sparse from assets/examples — canonical copy is now in the pod
 if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || \
-      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
+      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
       "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
     [[ -d "$SPARSE_PARENT" ]] && rm -rf "$SPARSE_PARENT"
 fi
