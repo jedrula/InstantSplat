@@ -66,6 +66,36 @@ ONTHEFLY_ITERS=30       # per-keyframe iterations for on-the-fly NVS (--sfm onth
 COLMAP_BA=0
 COLMAP_MATCHER=""
 CAMERA_MODEL="PINHOLE"   # PINHOLE | SIMPLE_RADIAL | RADIAL | OPENCV — non-PINHOLE triggers undistortion after SfM
+# Known intrinsics, comma-separated, matching CAMERA_MODEL's parameter order
+# (PINHOLE: fx,fy,cx,cy). Empty = let COLMAP guess, which is its no-EXIF fallback
+# f = 1.2 * max_dim. That guess is ~56% too large for an iPhone main camera (it
+# assumes a ~45° lens; the real one is ~66°), which fragments the view graph.
+# We already upload the true values as intrinsics.pincam — pass them here.
+CAMERA_PARAMS=""
+# gsplat pose/appearance optimisation. Both are implemented in simple_trainer.py
+# (pose_opt_lr 1e-5, app_opt_lr 1e-3) but were never forwarded from here, so no
+# server job could switch them on. SceneSplat-7K trains ARKitScenes with BOTH
+# enabled at exactly those learning rates — needed to reproduce their numbers,
+# and they target two failures we measured independently: ARKit pose drift and
+# exposure swing across a capture.
+POSE_OPT=0
+APP_OPT=0
+# MCMC splat cap. Flag overrides the GSPLAT_CAP_MAX env default (2M).
+# SceneSplat-7K uses 1,200,000; matching it matters for any PSNR comparison,
+# since extra gaussians buy PSNR regardless of pipeline quality.
+CAP_MAX=""
+# Sparse depth supervision. gsplat samples rendered depth at the projections of the
+# init point cloud's TRACK observations and compares against those points' depths -
+# so it needs points3D WITH tracks, and it needs fast-init OFF (fast-init skips
+# track loading entirely). SceneSplat-7K trains ARKitScenes with depth_lambda 1.0.
+DEPTH_LOSS=0
+# Initial gaussian opacity / scale. gsplat defaults (0.1 / 1.0) are tuned for a
+# SPARSE SfM init. A DENSE depth-derived cloud needs compact, confident splats:
+# SceneSplat-7K uses 0.5 / 0.1 for exactly that. Half a million large transparent
+# splats drives MCMC's opacity-weighted relocation sampler negative.
+INIT_OPA=""
+INIT_SCALE=""
+DEPTH_LAMBDA=""
 VIEW_GRAPH_CALIBRATOR=0
 NO_POINT_CAP=0
 NO_DENSIFICATION=0
@@ -124,6 +154,14 @@ while [[ $# -gt 0 ]]; do
         --colmap-ba)        COLMAP_BA=1;         shift ;;
         --colmap-matcher)   COLMAP_MATCHER="$2"; shift 2 ;;
         --camera-model)     CAMERA_MODEL="$2"; shift 2 ;;
+        --camera-params)    CAMERA_PARAMS="$2"; shift 2 ;;
+        --pose-opt)         POSE_OPT=1;          shift ;;
+        --app-opt)          APP_OPT=1;           shift ;;
+        --gsplat-cap-max)   CAP_MAX="$2";        shift 2 ;;
+        --depth-loss)       DEPTH_LOSS=1;        shift ;;
+        --init-opa)         INIT_OPA="$2";       shift 2 ;;
+        --init-scale)       INIT_SCALE="$2";     shift 2 ;;
+        --depth-lambda)     DEPTH_LAMBDA="$2";   shift 2 ;;
         --view-graph-calibrator) VIEW_GRAPH_CALIBRATOR=1; shift ;;
         --no-point-cap)      NO_POINT_CAP=1;      shift ;;
         --no-densification)  NO_DENSIFICATION=1;  shift ;;
@@ -143,6 +181,30 @@ while [[ $# -gt 0 ]]; do
         *)              VIDEOS+=("$1"); shift ;;
     esac
 done
+
+# Known-intrinsics argument for every feature_extractor call site. Built once so
+# the three sites stay in step. Empty CAMERA_PARAMS => array is empty => COLMAP
+# falls back to its guess exactly as before (no behaviour change when unset).
+_CAM_PARAMS_ARG=()
+if [[ -n "$CAMERA_PARAMS" ]]; then
+    _CAM_PARAMS_ARG=(--ImageReader.camera_params "$CAMERA_PARAMS")
+fi
+
+# gsplat pose/appearance optimisation args, built once for both strategy branches.
+# Empty unless requested, so the default path is byte-identical to before.
+_GS_OPT_ARGS=()
+[[ "$POSE_OPT" == "1" ]] && _GS_OPT_ARGS+=(--pose-opt)
+[[ "$APP_OPT"  == "1" ]] && _GS_OPT_ARGS+=(--app-opt)
+[[ "$DEPTH_LOSS" == "1" ]] && _GS_OPT_ARGS+=(--depth-loss)
+[[ -n "$INIT_OPA"   ]] && _GS_OPT_ARGS+=(--init-opa "$INIT_OPA")
+[[ -n "$INIT_SCALE" ]] && _GS_OPT_ARGS+=(--init-scale "$INIT_SCALE")
+[[ -n "$DEPTH_LAMBDA" ]] && _GS_OPT_ARGS+=(--depth-lambda "$DEPTH_LAMBDA")
+# --fast-init stays ON even with depth loss. Our local patch to
+# gsplat/examples/datasets/colmap.py reads the COLMAP tracks inside the fast path
+# (_load_colmap_tracks, gated on Parser(load_tracks=...)), because the non-fast
+# path needs pycolmap.SceneManager which official pycolmap 4.0.4 does not have.
+# Dropping fast-init here would route into that missing dependency and fail.
+_GS_FAST_INIT=(--fast-init)
 
 # ── Event emitter ────────────────────────────────────────────────────────────
 # Usage: emit_event '{"event": "...", ...extra keys...}'
@@ -383,11 +445,12 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model "$CAMERA_MODEL" \
         --ImageReader.single_camera 1 \
+        "${_CAM_PARAMS_ARG[@]}" \
         --FeatureExtraction.use_gpu 1 \
         --FeatureExtraction.max_image_size 1600 \
         2>&1 | tee "$MODEL_DIR/01a_colmap_features.log"
 
-    # Resolve matcher: explicit flag > auto (exhaustive ≤50 frames, sequential >50)
+    # Resolve matcher: explicit flag > auto (exhaustive ≤150 frames, else vocab_tree; never bare sequential)
     _MATCHER="${COLMAP_MATCHER}"
     if [[ -z "$_MATCHER" ]]; then
         # NEVER fall back to bare sequential: no loop closure starves the view graph on
@@ -511,6 +574,7 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model "$CAMERA_MODEL" \
         --ImageReader.single_camera 1 \
+        "${_CAM_PARAMS_ARG[@]}" \
         --FeatureExtraction.use_gpu 1 \
         --FeatureExtraction.max_image_size 1600 \
         2>&1 | tee "$MODEL_DIR/01a_glomap_features.log"
@@ -642,10 +706,18 @@ elif [[ "$SFM" == "glomap_aliked" ]]; then
     DB_PATH="$HLOC_WORK/database.db"   # hloc db; image IDs already match sparse/0 (no remap needed)
     rm -rf "$HLOC_WORK"
 
+    case "$COLMAP_MATCHER" in
+        exhaustive) _HLOC_PAIRS="exhaustive" ;;
+        vocab_tree) _HLOC_PAIRS="retrieval" ;;
+        sequential) _HLOC_PAIRS="sequential" ;;
+        *)          _HLOC_PAIRS="retrieval" ;;   # default: loop-closure-aware, scales (fixes sequential-fold)
+    esac
+    echo "[aliked] pair mode: $_HLOC_PAIRS (from --colmap-matcher='${COLMAP_MATCHER:-<unset>}')"
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/glomap_hloc.py" \
         "$IMAGE_DIR" \
         "$HLOC_WORK" \
         --matcher aliked+lightglue \
+        --pairs "$_HLOC_PAIRS" \
         --colmap-bin "$CONDA_BIN/colmap" \
         2>&1 | tee "$MODEL_DIR/01_glomap_aliked.log"
 
@@ -672,10 +744,22 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
     DB_PATH="$HLOC_WORK/database.db"   # hloc db; image IDs already match sparse/0 (no remap needed)
     rm -rf "$HLOC_WORK"
 
+    # Translate the pipeline's --colmap-matcher into an hloc pair mode. Without this the
+    # LoFTR path silently defaulted to sequential pairs (>50 frames) → GLOMAP view-graph
+    # starvation → folded geometry, even when the caller asked for exhaustive/vocab_tree.
+    # vocab_tree has no meaning for detector-free LoFTR → map it to NetVLAD retrieval.
+    case "$COLMAP_MATCHER" in
+        exhaustive) _HLOC_PAIRS="exhaustive" ;;
+        vocab_tree) _HLOC_PAIRS="retrieval" ;;
+        sequential) _HLOC_PAIRS="sequential" ;;
+        *)          _HLOC_PAIRS="retrieval" ;;   # default: loop-closure-aware, scales
+    esac
+    echo "[loftr] pair mode: $_HLOC_PAIRS (from --colmap-matcher='${COLMAP_MATCHER:-<unset>}')"
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/glomap_hloc.py" \
         "$IMAGE_DIR" \
         "$HLOC_WORK" \
         --matcher loftr_indoor \
+        --pairs "$_HLOC_PAIRS" \
         --colmap-bin "$CONDA_BIN/colmap" \
         2>&1 | tee "$MODEL_DIR/01_glomap_loftr.log"
 
@@ -753,11 +837,19 @@ elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "c
         [[ -n "$_FL" ]] && _FL_ARG="--focal-length $_FL"
     fi
 
+    case "$COLMAP_MATCHER" in
+        exhaustive) _HLOC_PAIRS="exhaustive" ;;
+        vocab_tree) _HLOC_PAIRS="retrieval" ;;
+        sequential) _HLOC_PAIRS="sequential" ;;
+        *)          _HLOC_PAIRS="retrieval" ;;   # default: loop-closure-aware, scales (fixes sequential-fold)
+    esac
+    echo "[hloc] pair mode: $_HLOC_PAIRS (from --colmap-matcher='${COLMAP_MATCHER:-<unset>}')"
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/glomap_hloc.py" \
         "$IMAGE_DIR" \
         "$HLOC_WORK" \
         --matcher "$_MATCHER" \
         --mapper "$_MAPPER" \
+        --pairs "$_HLOC_PAIRS" \
         $_FL_ARG \
         --colmap-bin "$CONDA_BIN/colmap" \
         2>&1 | tee "$MODEL_DIR/01_${SFM}.log"
@@ -792,6 +884,7 @@ elif [[ "$SFM" == "fastmap" ]]; then
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model PINHOLE \
         --ImageReader.single_camera 1 \
+        "${_CAM_PARAMS_ARG[@]}" \
         --FeatureExtraction.use_gpu 1 \
         --FeatureExtraction.max_image_size 1600 \
         2>&1 | tee "$MODEL_DIR/01a_fastmap_features.log"
@@ -1253,6 +1346,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         PYTHONPATH="$REPO/../gsplat/examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "$PYTHON" "$REPO/../gsplat/examples/simple_trainer.py" mcmc \
             --data-dir "$SCENE_DIR" \
             --data-factor "${GSPLAT_DATA_FACTOR:-1}" \
+            "${_GS_OPT_ARGS[@]}" \
             --result-dir "$GSPLAT_OUT" \
             --max-steps "$ITERS" \
             --eval-steps "$ITERS" \
@@ -1260,13 +1354,13 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
             --ply-steps "$ITERS" \
             --save-ply \
             --init-type sfm \
-            --fast-init \
+            "${_GS_FAST_INIT[@]}" \
             "${_GSPLAT_VIEWER_ARGS[@]}" \
             --disable-video \
             --ssim-lambda "$GSPLAT_SSIM_LAMBDA" \
             "${_GSPLAT_PP_ARGS[@]}" \
             --opacity-reg 0.05 \
-            --strategy.cap-max "${GSPLAT_CAP_MAX:-2000000}" \
+            --strategy.cap-max "${CAP_MAX:-${GSPLAT_CAP_MAX:-2000000}}" \
             --strategy.refine-stop-iter "$_GS_MCMC_STOP" \
             2>&1 | tee "$MODEL_DIR/02_train.log"
     else
@@ -1279,6 +1373,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         PYTHONPATH="$REPO/../gsplat/examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$REPO/../gsplat/examples/simple_trainer.py" default \
             --data-dir "$SCENE_DIR" \
             --data-factor "${GSPLAT_DATA_FACTOR:-1}" \
+            "${_GS_OPT_ARGS[@]}" \
             --result-dir "$GSPLAT_OUT" \
             --max-steps "$ITERS" \
             --eval-steps "$ITERS" \
@@ -1286,7 +1381,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
             --ply-steps "$ITERS" \
             --save-ply \
             --init-type sfm \
-            --fast-init \
+            "${_GS_FAST_INIT[@]}" \
             "${_GSPLAT_VIEWER_ARGS[@]}" \
             --disable-video \
             --ssim-lambda "$GSPLAT_SSIM_LAMBDA" \
@@ -1323,7 +1418,7 @@ elif [[ "$TRAINER" == "2dgs" ]]; then
         --ply-steps "$ITERS" \
         --save-ply \
         --init-type sfm \
-        --fast-init \
+        "${_GS_FAST_INIT[@]}" \
         --disable-viewer \
         --disable-video \
         --ssim-lambda "$GSPLAT_SSIM_LAMBDA" \
@@ -1460,6 +1555,36 @@ PLY2SPLAT_START=$(date +%s)
 PLY2SPLAT_ELAPSED=$(( $(date +%s) - PLY2SPLAT_START ))
 SPLAT_SIZE=$(stat -c%s "$SPLAT_OUT" 2>/dev/null || echo 0)
 emit_event "{\"event\":\"splat_ready\",\"filename\":\"$(basename $SPLAT_OUT)\",\"size_bytes\":$SPLAT_SIZE,\"ply2splat_s\":$PLY2SPLAT_ELAPSED}"
+
+# ── Step 3b: PLY → .sog (web delivery) ───────────────────────────────────────
+# The web viewers download this instead of the raw PLY: measured 149.4 MB -> 10.9 MB
+# (13.7x) with ALL 45 f_rest spherical-harmonic coefficients retained, position error
+# 0.176 mm median. Doing it here rather than lazily on first HTTP request matters —
+# conversion runs k-means over the SH palette and takes ~70 s for 600k splats, which
+# through the Cloudflare tunnel would blow the ~100 s edge timeout and look like a
+# broken viewer. The server's /sog endpoint still converts on demand for older pods.
+#
+# Non-fatal on purpose: this is a delivery optimisation, and a splat that trained fine
+# should not be reported as a failed job because a post-process step was unavailable.
+# That is the one place a fallback is right — it degrades to "server converts later",
+# it does not hide a training problem.
+SOG_OUT="${PLY%.ply}.sog"
+SPLAT_TRANSFORM_BIN="${SPLAT_TRANSFORM_BIN:-/home/communications/.nvm/versions/node/v22.22.2/bin/splat-transform}"
+if [[ -x "$SPLAT_TRANSFORM_BIN" ]]; then
+    echo "[3b/3] Converting to .sog for web delivery..."
+    SOG_START=$(date +%s)
+    if "$SPLAT_TRANSFORM_BIN" "$PLY" "$SOG_OUT" >/dev/null 2>&1; then
+        SOG_ELAPSED=$(( $(date +%s) - SOG_START ))
+        SOG_SIZE=$(stat -c%s "$SOG_OUT" 2>/dev/null || echo 0)
+        echo "        $(numfmt --to=iec $SOG_SIZE 2>/dev/null || echo $SOG_SIZE) in ${SOG_ELAPSED}s"
+        emit_event "{\"event\":\"sog_ready\",\"filename\":\"$(basename $SOG_OUT)\",\"size_bytes\":$SOG_SIZE,\"sog_s\":$SOG_ELAPSED}"
+    else
+        echo "        WARNING: splat-transform failed; /sog will convert on first request"
+        rm -f "$SOG_OUT"
+    fi
+else
+    echo "[3b/3] skipping .sog — splat-transform not found at $SPLAT_TRANSFORM_BIN"
+fi
 
 # ── Save run metadata ─────────────────────────────────────────────────────────
 PIPELINE_END=$(date +%s)
