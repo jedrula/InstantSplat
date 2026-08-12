@@ -8,6 +8,13 @@ and guidance on how to improve quality further.
 
 ## Performance
 - [ ] Compile RoPE2D CUDA kernel to speed up MASt3R inference (~20-40% faster on that step).
+- [ ] Rebuild Ceres with cuDSS support: COLMAP 4.x mapper/global_positioner requests GPU
+  bundle adjustment but falls back to CPU ("Ceres was compiled without cuDSS support"
+  warning in every colmap/glomap run). Matters most for colmap_sift incremental mapper
+  on large scenes (900+ images → ~1-2 h SfM, dominated by repeated global BA rounds —
+  GPU BA could cut this substantially). Needs: NVIDIA cuDSS lib + Ceres ≥2.3 rebuilt
+  with -DUSE_CUDSS=ON, then rebuild/reinstall COLMAP 4.x against it in the
+  instantsplat conda env.
       Currently falls back to slow PyTorch version: "cannot find cuda-compiled version of RoPE2D".
       Requires building the CUDA extension inside the mast3r/dust3r submodule.
 
