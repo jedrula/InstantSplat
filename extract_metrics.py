@@ -285,6 +285,69 @@ def extract_brush_metrics(pod_dir: str) -> dict:
     return result
 
 
+# ── Reference-free splat/SfM health (no GPU/AI) ───────────────────────────────
+
+def extract_ply_health(pod_dir: str, sparse_dir=None) -> dict:
+    """Cheap reference-free quality signals persisted to pod.json so /history shows them:
+    n_gaussians, floater %, giant-gaussian %, opacity, #SfM components, convergence.
+    Wrapped so it can NEVER break the core metrics (returns partial/{} on any error)."""
+    out: dict = {}
+    try:
+        import re as _re, glob as _g
+        import numpy as np
+        from plyfile import PlyData
+        plys = sorted(_g.glob(os.path.join(pod_dir, "brush_output", "export_*.ply")),
+                      key=lambda p: int(_re.findall(r"(\d+)", os.path.basename(p))[-1] or 0))
+        if not plys:
+            plys = sorted(_g.glob(os.path.join(pod_dir, "point_cloud", "iteration_*", "point_cloud.ply")))
+        if plys:
+            v = PlyData.read(plys[-1]).elements[0].data
+            xyz = np.stack([v["x"], v["y"], v["z"]], 1).astype(np.float64)
+            out["n_gaussians"] = int(len(xyz))
+            if "scale_0" in v.dtype.names and "opacity" in v.dtype.names:
+                scale = np.exp(np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], 1).astype(np.float64))
+                opac = 1.0 / (1.0 + np.exp(-v["opacity"].astype(np.float64)))
+                ref = xyz
+                if sparse_dir:
+                    try:
+                        import pycolmap
+                        r = pycolmap.Reconstruction(sparse_dir)
+                        if r.num_points3D() > 10:
+                            ref = np.array([p.xyz for p in r.points3D.values()])
+                    except Exception:
+                        pass
+                    try:
+                        comps = [d for d in _g.glob(os.path.join(os.path.dirname(sparse_dir), "*"))
+                                 if os.path.isdir(d) and os.path.basename(d).isdigit()]
+                        out["sfm_components"] = len(comps)
+                    except Exception:
+                        pass
+                lo, hi = np.percentile(ref, 1, 0), np.percentile(ref, 99, 0)
+                ctr, half = (lo + hi) / 2, (hi - lo) / 2 + 1e-9
+                extent = float(np.linalg.norm(hi - lo))
+                maxs = scale.max(1)
+                out["floater_frac_pct"] = round(100 * float(np.any(np.abs(xyz - ctr) > 1.5 * half, 1).mean()), 2)
+                out["giant_gaussian_frac_pct"] = round(100 * float((maxs > 0.1 * extent).mean()), 3)
+                out["opacity_p50"] = round(float(np.median(opac)), 3)
+    except Exception:
+        pass
+    # convergence from brush eval trajectory
+    try:
+        import re as _re
+        log = os.path.join(pod_dir, "02_train.log")
+        if os.path.exists(log):
+            ev = _re.findall(r"Eval iter (\d+): PSNR ([\d.]+)", open(log, errors="ignore").read())
+            ev = [(int(i), float(p)) for i, p in ev]
+            if len(ev) >= 2 and ev[-1][0] > ev[-4:][0][0]:
+                tail = ev[-4:]
+                slope = (tail[-1][1] - tail[0][1]) / ((tail[-1][0] - tail[0][0]) / 1000)
+                out["psnr_slope_db_per_1k"] = round(slope, 3)
+                out["converged"] = bool(abs(slope) < 0.15)
+    except Exception:
+        pass
+    return out
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -317,6 +380,9 @@ def main():
     if sparse_dir:
         sfm = extract_sfm_metrics(sparse_dir)
         metrics.update(sfm)
+
+    # Reference-free splat/SfM health (persisted so /history shows beyond-PSNR quality)
+    metrics.update(extract_ply_health(pod_dir, sparse_dir))
 
     print(json.dumps(metrics))
 
