@@ -51,7 +51,7 @@ SMART_FRAMES=0
 SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
-SFM="mast3r"       # mast3r | fast3r | colmap_sift | glomap_sift | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | glomap_dedode | colmap_aliked | fastmap | realityscan | onthefly
+SFM="mast3r"       # mast3r | fast3r | pose_prior | colmap_sift | glomap_sift | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | glomap_dedode | colmap_aliked | fastmap | realityscan | onthefly
 TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat | onthefly | brush
 LANGSPLAT=0         # 1 = run LangSplat pipeline after training
 LANGSPLAT_ITERS=3000
@@ -126,6 +126,8 @@ while [[ $# -gt 0 ]]; do
         --sparse-pairs) SPARSE_PAIRS=1;    shift ;;
         --sparse-ga)    SPARSE_GA=1;       shift ;;
         --sfm)              SFM="$2";            shift 2 ;;
+        --arkit-dir)        ARKIT_DIR="$2";      shift 2 ;;
+        --prior-std)        PRIOR_STD="$2";      shift 2 ;;
         --trainer)          TRAINER="$2";        shift 2 ;;
         --mcmc)             MCMC=1;              shift ;;
         --post-processing)  GSPLAT_POST_PROCESSING="$2"; shift 2 ;;
@@ -236,6 +238,37 @@ if [[ "$SFM" == "preposed" ]]; then
         brush|gsplat|2dgs|splatfacto) ;;
         *) echo "Error: --sfm preposed does not support --trainer $TRAINER (supported: brush, gsplat, 2dgs, splatfacto)"; exit 1 ;;
     esac
+fi
+# --sfm pose_prior: seed COLMAP's mapper with the phone's ARKit poses instead of letting it
+# bootstrap poses from matches alone. That bootstrap is the step that fails — on MuSHRoom's
+# sauna it gave 44 cm LOCAL error and on honka a 30 cm global warp. With priors, measured
+# against those rooms' Faro scans: honka 0.90 cm (reference pipeline: 0.91), sauna 2.62 cm
+# (reference: 3.40) — matching on one room and beating it on the one our SfM broke.
+#
+# Implemented as a PRE-STEP that emits a COLMAP model, then falls through to the existing
+# preposed_colmap path, so none of that plumbing is duplicated.
+if [[ "$SFM" == "pose_prior" ]]; then
+    [[ -z "$ARKIT_DIR" ]] && { echo "Error: --sfm pose_prior requires --arkit-dir PATH (a pod with images/, frames.traj, intrinsics.pincam)"; exit 1; }
+    for _f in images frames.traj intrinsics.pincam; do
+        [[ -e "$ARKIT_DIR/$_f" ]] || { echo "Error: $ARKIT_DIR/$_f not found"; exit 1; }
+    done
+    case "$TRAINER" in
+        brush|gsplat|2dgs|splatfacto) ;;
+        *) echo "Error: --sfm pose_prior does not support --trainer $TRAINER (supported: brush, gsplat, 2dgs, splatfacto)"; exit 1 ;;
+    esac
+    # COLMAP 4.x only: 3.9.1 has no pose_prior_mapper and its SIFT descriptors are
+    # incompatible with 4.x, so the whole chain must stay on one generation.
+    COLMAP4_BIN="${COLMAP4_BIN:-$CONDA_BIN/colmap}"
+    [[ -x "$COLMAP4_BIN" ]] || { echo "Error: COLMAP 4.x not found at $COLMAP4_BIN (set COLMAP4_BIN)"; exit 1; }
+    _PP_OUT="$REPO/output_infer/${SCENE}_posePrior"
+    echo ""
+    echo "[0/3] Building preposed model from ARKit pose priors -> $_PP_OUT"
+    "$PYTHON" "$REPO/arkit_pose_prior.py" \
+        --images "$ARKIT_DIR/images" --traj "$ARKIT_DIR/frames.traj" \
+        --pincam "$ARKIT_DIR/intrinsics.pincam" --out "$_PP_OUT" \
+        --prior-std "${PRIOR_STD:-0.01}" --colmap "$COLMAP4_BIN" || exit 1
+    SFM="preposed_colmap"
+    PREPOSED_DIR="$_PP_OUT"
 fi
 if [[ "$SFM" == "preposed_colmap" ]]; then
     [[ -z "$PREPOSED_DIR" ]] && { echo "Error: --sfm preposed_colmap requires --preposed-dir PATH"; exit 1; }
