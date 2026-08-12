@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 import pycolmap
-from hloc import extract_features, match_dense, match_features, pairs_from_exhaustive
+from hloc import extract_features, match_dense, match_features, pairs_from_exhaustive, pairs_from_retrieval
 from hloc.reconstruction import (
     create_empty_db,
     estimation_and_geometric_verification,
@@ -122,6 +122,13 @@ def main():
                     help="Path to colmap binary with global_mapper (GLOMAP 4.x)")
     ap.add_argument("--sequential-overlap", type=int, default=10,
                     help="Frames to pair sequentially when >50 frames")
+    ap.add_argument("--pairs", default="auto",
+                    choices=["auto", "exhaustive", "sequential", "retrieval"],
+                    help="Pair-generation mode. auto=exhaustive if <=50 frames else sequential. "
+                         "retrieval=NetVLAD top-k (loop-closure aware, scales past exhaustive); "
+                         "the correct vocab-tree equivalent for detector-free matchers like LoFTR.")
+    ap.add_argument("--retrieval-k", type=int, default=25,
+                    help="Top-k neighbours per image for --pairs retrieval")
     args = ap.parse_args()
 
     image_dir: Path = args.image_dir
@@ -150,11 +157,26 @@ def main():
         import shutil
         colmap_bin = shutil.which("colmap") or "colmap"
 
-    # ── Pair generation (same for both paths) ────────────────────────────────
-    if n <= 50:
+    # ── Pair generation ──────────────────────────────────────────────────────
+    pair_mode = args.pairs
+    if pair_mode == "auto":
+        pair_mode = "exhaustive" if n <= 50 else "sequential"
+
+    if pair_mode == "exhaustive":
         print(f"[hloc] Generating exhaustive pairs ({n*(n-1)//2} pairs)...", flush=True)
         pairs_from_exhaustive.main(pairs_txt, image_list=image_list)
-    else:
+    elif pair_mode == "retrieval":
+        # NetVLAD global descriptors → top-k nearest neighbours. Loop-closure aware and
+        # O(n*k) instead of O(n^2), so it scales past exhaustive while avoiding the
+        # sequential view-graph starvation that folds GLOMAP on revisiting captures.
+        k = min(args.retrieval_k, n - 1)
+        global_desc = out / "global-feats-netvlad.h5"
+        retrieval_conf = extract_features.confs["netvlad"]
+        print(f"[hloc] Extracting NetVLAD global descriptors ({n} images)...", flush=True)
+        extract_features.main(retrieval_conf, image_dir, feature_path=global_desc)
+        print(f"[hloc] Generating retrieval pairs (NetVLAD top-{k}, ~{n*k} pairs)...", flush=True)
+        pairs_from_retrieval.main(global_desc, pairs_txt, num_matched=k)
+    else:  # sequential
         print(f"[hloc] Generating sequential pairs (overlap={args.sequential_overlap})...", flush=True)
         make_sequential_pairs(image_list, args.sequential_overlap, pairs_txt)
 
