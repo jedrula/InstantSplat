@@ -451,6 +451,9 @@ class Runner:
                 load_exposure=cfg.load_exposure,
                 fast_init=cfg.fast_init,
                 mask_dir=cfg.mask_dir,
+                # depth loss supervises at track projections, so tracks must be
+                # read even under fast_init (official pycolmap has no SceneManager)
+                load_tracks=cfg.depth_loss,
             )
             self.trainset = Dataset(
                 self.parser,
