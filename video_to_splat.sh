@@ -102,6 +102,25 @@ NO_DENSIFICATION=0
 FRAMES_ONLY=0
 SKIP_EXTRACTION=0
 IMAGE_SIZE=256
+# COLMAP feature-extraction resolution cap for the SIFT paths (glomap_sift,
+# colmap_sift, fastmap). This was a hardcoded 1600 literal at all three call
+# sites, so `--image-size` never reached them and SfM resolution was not a
+# controllable variable: natively 1920x1440 uploads had their keypoints detected
+# at 1600x1200 and rescaled. 1600 remains the default, so every existing run is
+# unchanged; `--sfm-image-size 1920` makes it a real one-variable experiment.
+# NOT the same knob as --image-size, which is the MASt3R/Fast3R input size (256).
+SFM_MAX_IMAGE_SIZE=1600
+# Brush densification stop. Brush's own default is the ABSOLUTE iteration 15000, chosen
+# against its default --total-steps 30000 — i.e. "stop growing at 50%, refine the back half".
+# Every 3DGS implementation uses that same 50% convention and the same absolute encoding:
+# reference 3DGS densify_until_iter 15000/30000, gsplat refine_stop_iter 15000, nerfstudio
+# splatfacto stop_split_at 15000. Because it is absolute, ANY run shorter than 15k never
+# stops growing and gets ZERO refinement phase — measured on our 7k runs, which were still
+# densifying at iter 6801. "half" restores the intended ratio at whatever ITERS we run.
+#   half   = ITERS/2  (default; 3500 for a 7k run)
+#   brush  = 15000    (Brush/upstream literal; a no-op for runs shorter than 15k)
+#   <int>  = explicit iteration
+GROWTH_STOP="half"
 MODEL_DIR_OVERRIDE=""
 PREPOSED_DIR=""
 # Per-video lists (comma-separated, one entry per video)
@@ -168,6 +187,8 @@ while [[ $# -gt 0 ]]; do
         --no-point-cap)      NO_POINT_CAP=1;      shift ;;
         --no-densification)  NO_DENSIFICATION=1;  shift ;;
         --image-size)   IMAGE_SIZE="$2";   shift 2 ;;
+        --sfm-image-size) SFM_MAX_IMAGE_SIZE="$2"; shift 2 ;;
+        --growth-stop) GROWTH_STOP="$2"; shift 2 ;;
         --model-dir)    MODEL_DIR_OVERRIDE="$2"; shift 2 ;;
         --preposed-dir) PREPOSED_DIR="$2";      shift 2 ;;
         --fps-list)     FPS_LIST="$2";     shift 2 ;;
@@ -183,6 +204,25 @@ while [[ $# -gt 0 ]]; do
         *)              VIDEOS+=("$1"); shift ;;
     esac
 done
+
+# SfM feature-extraction cap: must be a positive integer, since it is spliced
+# straight into the COLMAP command line at three call sites.
+if ! [[ "$SFM_MAX_IMAGE_SIZE" =~ ^[0-9]+$ ]] || (( SFM_MAX_IMAGE_SIZE <= 0 )); then
+    echo "Error: --sfm-image-size must be a positive integer (got '$SFM_MAX_IMAGE_SIZE')"; exit 1
+fi
+
+# Resolve --growth-stop to a concrete iteration. Done after ITERS is known.
+_GROWTH_STOP_ITER=""
+case "$GROWTH_STOP" in
+    half)  [[ -n "$ITERS" ]] && _GROWTH_STOP_ITER=$(( ITERS / 2 )) ;;
+    brush|default) _GROWTH_STOP_ITER=15000 ;;
+    ''|none) _GROWTH_STOP_ITER="" ;;
+    *) if [[ "$GROWTH_STOP" =~ ^[0-9]+$ ]] && (( GROWTH_STOP > 0 )); then
+           _GROWTH_STOP_ITER="$GROWTH_STOP"
+       else
+           echo "Error: --growth-stop must be 'half', 'brush', or a positive integer (got '$GROWTH_STOP')"; exit 1
+       fi ;;
+esac
 
 # Known-intrinsics argument for every feature_extractor call site. Built once so
 # the three sites stay in step. Empty CAMERA_PARAMS => array is empty => COLMAP
@@ -473,6 +513,7 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     # Use conda COLMAP 4.x throughout: GPU SIFT + matching, and the same DB
     # schema for the incremental mapper (mixing /usr/bin/colmap 3.9 broke GPU).
     echo "    Camera model: $CAMERA_MODEL"
+    echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
     "$CONDA_BIN/colmap" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
@@ -480,7 +521,7 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
         --ImageReader.single_camera 1 \
         "${_CAM_PARAMS_ARG[@]}" \
         --FeatureExtraction.use_gpu 1 \
-        --FeatureExtraction.max_image_size 1600 \
+        --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
         2>&1 | tee "$MODEL_DIR/01a_colmap_features.log"
 
     # Resolve matcher: explicit flag > auto (exhaustive ≤150 frames, else vocab_tree; never bare sequential)
@@ -602,6 +643,7 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
     # Use $CONDA_BIN/colmap throughout so features, matching, and global_mapper
     # all share the same DB schema — no version mismatch, retriangulation works.
     echo "    Camera model: $CAMERA_MODEL"
+    echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
     "$CONDA_BIN/colmap" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
@@ -609,7 +651,7 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
         --ImageReader.single_camera 1 \
         "${_CAM_PARAMS_ARG[@]}" \
         --FeatureExtraction.use_gpu 1 \
-        --FeatureExtraction.max_image_size 1600 \
+        --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
         2>&1 | tee "$MODEL_DIR/01a_glomap_features.log"
 
     _MATCHER="${COLMAP_MATCHER}"
@@ -912,6 +954,7 @@ elif [[ "$SFM" == "fastmap" ]]; then
     rm -rf "$FM_OUTPUT"
     export QT_QPA_PLATFORM=offscreen
 
+    echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
     "$CONDA_BIN/colmap" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
@@ -919,7 +962,7 @@ elif [[ "$SFM" == "fastmap" ]]; then
         --ImageReader.single_camera 1 \
         "${_CAM_PARAMS_ARG[@]}" \
         --FeatureExtraction.use_gpu 1 \
-        --FeatureExtraction.max_image_size 1600 \
+        --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
         2>&1 | tee "$MODEL_DIR/01a_fastmap_features.log"
 
     _MATCHER="${COLMAP_MATCHER}"
@@ -1010,20 +1053,65 @@ elif [[ "$SFM" == "realityscan" ]]; then
     # RealityScan (Wine) cannot decode progressive JPEGs — re-encode them as baseline in-place.
     # SOF2 marker (0xFFC2) = progressive; SOF0 (0xFFC0) = baseline.
     python3 - "$IMAGE_DIR" <<'PYEOF'
-import sys, os
+import sys, os, io
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+def app_segments(buf, markers=(0xE1, 0xE2, 0xED)):
+    """Byte ranges of the APP segments carrying EXIF / XMP / ICC / IPTC.
+
+    Re-encoding through PIL drops all of them, and on a DJI frame that is the gimbal
+    orientation, flight yaw, relative altitude and GPS fix -- gravity and metric scale, for
+    free -- while on a phone frame it is the focal length COLMAP reads as its intrinsics prior
+    (the mapper warns "Less than 50% of cameras have prior focal lengths" without it). Carrying
+    the raw segments keeps whatever the camera wrote, maker notes included, rather than only
+    the tags PIL happens to model."""
+    if len(buf) < 4 or buf[0] != 0xFF or buf[1] != 0xD8:
+        return []
+    out, i = [], 2
+    while i + 3 < len(buf):
+        if buf[i] != 0xFF:
+            break
+        m = buf[i + 1]
+        if m in (0xDA, 0xD9):                      # start of scan / end of image
+            break
+        if m == 0x01 or 0xD0 <= m <= 0xD7:         # standalone markers, no length field
+            i += 2
+            continue
+        ln = (buf[i + 2] << 8) | buf[i + 3]
+        if ln < 2 or i + 2 + ln > len(buf):
+            break
+        if m in markers:
+            out.append(buf[i:i + 2 + ln])
+        i += 2 + ln
+    return out
+
+
+def splice(buf, segs):
+    """Insert `segs` after the JFIF APP0 the encoder wrote (or straight after SOI)."""
+    at = 2
+    if len(buf) > 4 and buf[2] == 0xFF and buf[3] == 0xE0:
+        at = 4 + ((buf[4] << 8) | buf[5])
+    return buf[:at] + b"".join(segs) + buf[at:]
+
+
 img_dir = sys.argv[1]
 for fname in os.listdir(img_dir):
     if not fname.lower().endswith(('.jpg', '.jpeg')):
         continue
     path = os.path.join(img_dir, fname)
     with open(path, 'rb') as f:
-        data = f.read(65536)
-    if b'\xff\xc2' in data:  # SOF2 = progressive JPEG
-        print(f"    ⚠  re-encoding progressive JPEG: {fname}")
-        im = Image.open(path).convert('RGB')
-        im.save(path, 'JPEG', quality=95, progressive=False, optimize=False)
+        original = f.read()
+    if b'\xff\xc2' in original[:65536]:  # SOF2 = progressive JPEG
+        print(f"    ⚠  re-encoding progressive JPEG (metadata preserved): {fname}")
+        im = Image.open(io.BytesIO(original)).convert('RGB')
+        buf = io.BytesIO()
+        im.save(buf, 'JPEG', quality=95, progressive=False, optimize=False)
+        # convert('RGB') does not rotate, and the size is unchanged, so every carried tag --
+        # Orientation and pixel dimensions included -- still describes these pixels correctly.
+        with open(path, 'wb') as f:
+            f.write(splice(buf.getvalue(), app_segments(original)))
 PYEOF
 
     # rs_colmap_params.xml  → COLMAP writer (images.txt + points3D.txt, undistorted images)
@@ -1485,6 +1573,26 @@ elif [[ "$TRAINER" == "brush" ]]; then
     # BRUSH_EXTRA_ARGS: space-separated additional flags passed through --brush-extra-args
     _BRUSH_EXTRA=()
     [[ -n "${BRUSH_EXTRA_ARGS:-}" ]] && read -ra _BRUSH_EXTRA <<< "$BRUSH_EXTRA_ARGS"
+    # Cap densification. Brush's own default is 10M splats, which no 8GB card can
+    # hold: at ~830MB/million, past ~6.9M splats wgpu dies mid-refine with
+    # "Device::poll: Validation Error" -> burn-fusion panic -> exit 134 (killed
+    # jobs 787e1895 @13801 iters/6.86M splats and 203803d1 @6.62M on 2026-08-17).
+    # Long runs hit it first because growth only stops at --growth-stop-iter 15000.
+    # Override with BRUSH_MAX_SPLATS=N, or an explicit --max-splats in
+    # --brush-extra-args (checked here so we never pass the flag twice).
+    if [[ " ${_BRUSH_EXTRA[*]} " != *" --max-splats "* && " ${_BRUSH_EXTRA[*]} " != *" --max-splats="* ]]; then
+        _BRUSH_EXTRA+=(--max-splats "${BRUSH_MAX_SPLATS:-2500000}")
+    fi
+    # Densification stop. Without this Brush keeps its absolute 15000 default, which for any
+    # run shorter than that means growth NEVER stops and the model gets no refinement phase
+    # (our 7k runs were still densifying at iter 6801, shipping a still-growing model).
+    # Skipped when the caller already passed --growth-stop-iter explicitly.
+    if [[ -n "$_GROWTH_STOP_ITER" && \
+          " ${_BRUSH_EXTRA[*]} " != *" --growth-stop-iter "* && \
+          " ${_BRUSH_EXTRA[*]} " != *" --growth-stop-iter="* ]]; then
+        _BRUSH_EXTRA+=(--growth-stop-iter "$_GROWTH_STOP_ITER")
+        echo "    Growth stops at iter $_GROWTH_STOP_ITER (--growth-stop=$GROWTH_STOP, total $ITERS)"
+    fi
     RUST_LOG=brush_cli=info "$BRUSH_BIN" "$_BRUSH_SCENE" \
         --total-steps "$ITERS" \
         --export-path "$BRUSH_OUT" \
