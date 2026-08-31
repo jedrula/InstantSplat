@@ -17,9 +17,7 @@ output_infer/
 output_glomap/
 demo_outputs/
 dust3r_visloc/
-# Third-party checkouts and build output that live in the tree but are not ours
-croco/
-submodules/simple-knn/
+# Rust build output from the brush trainer -- 147M, regeneratable
 target/
 # Sparse-reconstruction archive: 534M of regeneratable scene data, same class as
 # assets/examples/ above
