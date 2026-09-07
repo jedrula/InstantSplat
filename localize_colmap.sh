@@ -20,27 +20,21 @@ QUERY_IMG="${2:?Usage: $0 <pod_dir> <query_image> [output.json] [--vocab-tree]}"
 OUTPUT_JSON="${3:-$POD_DIR/localized_camera.json}"
 USE_VOCAB_TREE="${4:-}"  # pass --vocab-tree to use vocab_tree_matcher (slower for small scenes)
 
-# ── Choose COLMAP binary based on which SfM built this pod ───────────────────
-# glomap_* pods: built with $CONDA_BIN/colmap (4.0.4, CUDA GPU-SIFT).
-#   Must match — COLMAP 3.9.1 CPU-SIFT descriptors are a different uint8 format
-#   and RANSAC gets 0 verified pairs even though both are uint8/128-dim.
-#   Also the GLOMAP DB schema has `type NOT NULL` in descriptors; only 4.0.4 can INSERT.
-# colmap_sift pods: built with /usr/bin/colmap (3.9.1, no CUDA).
-COLMAP4=/home/communications/miniconda3/envs/instantsplat/bin/colmap
-COLMAP3=/usr/bin/colmap
-
-POD_SFM=$(python3 -c "import json,sys; d=json.load(open('$POD_DIR/pod.json')); print(d.get('params',d).get('sfm','unknown'))" 2>/dev/null || echo "unknown")
-if [[ "$POD_SFM" == glomap_* || "$POD_SFM" == "glomap" ]]; then
-    COLMAP="$COLMAP4"
-    GPU_FLAG_EXTRACT="--FeatureExtraction.use_gpu 1"
-    GPU_FLAG_MATCH="--FeatureMatching.use_gpu 1"
-    echo "  sfm=$POD_SFM → using COLMAP 4.0.4 (GPU)"
-else
-    COLMAP="$COLMAP3"
-    GPU_FLAG_EXTRACT="--SiftExtraction.use_gpu 0"
-    GPU_FLAG_MATCH="--SiftMatching.use_gpu 0"
-    echo "  sfm=$POD_SFM → using COLMAP 3.9.1 (CPU)"
-fi
+# ── COLMAP ───────────────────────────────────────────────────────────────────
+# Use the binary that BUILT this pod, which the pod records itself. Query descriptors must come
+# from it: GPU-SIFT format changed between COLMAP generations and a mismatch yields 0 verified
+# pairs with no error, which reads like a bad query image.
+#
+# No version dispatch and no default path here on purpose — the pod is the single source of
+# truth, so there is nothing to keep in sync with video_to_splat.sh. Pods built before
+# 2026-09-07 have no marker and must have their SfM re-run to be localizable.
+MARKER="$POD_DIR/colmap_version.txt"
+[[ -f "$MARKER" ]] || { echo "ERROR: $MARKER missing — pod predates COLMAP version recording (2026-09-07). Re-run its SfM." >&2; exit 1; }
+COLMAP=$(head -1 "$MARKER")
+[[ -x "$COLMAP" ]] || { echo "ERROR: this pod was built with '$COLMAP', which is not executable here." >&2; exit 1; }
+GPU_FLAG_EXTRACT="--FeatureExtraction.use_gpu 1"
+GPU_FLAG_MATCH="--FeatureMatching.use_gpu 1"
+echo "  COLMAP: $(tail -1 "$MARKER")"
 
 VOCAB_TREE="$REPO/assets/vocab_tree_flickr100K_words32K.bin"
 

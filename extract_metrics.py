@@ -231,6 +231,33 @@ def extract_sfm_metrics(sparse_dir: str) -> dict:
         except Exception:
             pass
 
+    # Mean track length — how many views actually see the average point. This is the variable
+    # that predicts whether the capture is view-graph starved, and `registered_images` hides
+    # it completely (48/48 on the bad DJI job; 250/251 on 4f280a9e).
+    #
+    # It is also what decides whether exhaustive matching is worth paying for. Measured
+    # 2026-09-07, same SfM, matcher as the only variable:
+    #
+    #   capture     baseline track len   exhaustive gain
+    #   b36e3755    starved (6-8 pairs)      +0.78 dB
+    #   4f280a9e    6.18                     +0.29 dB
+    #   da329e40    7.54                     +0.02 dB  (for +269 s)
+    #
+    # i.e. the benefit tracks track length, NOT frame count — da329e40 is the LARGER capture
+    # and gained nothing. Recording this is the prerequisite for escalating to exhaustive
+    # conditionally instead of by a frame-count threshold.
+    try:
+        import pycolmap
+        rec = pycolmap.Reconstruction(sparse_dir)
+        if rec.num_points3D():
+            result["track_len_mean"] = round(rec.compute_mean_track_length(), 3)
+            result["obs_per_image_mean"] = round(
+                rec.compute_mean_observations_per_reg_image(), 1)
+    except Exception as e:
+        # Absent metric, not a masked failure: every caller treats these as optional and the
+        # reconstruction itself is unaffected. Say so rather than swallowing it silently.
+        print(f"[metrics] track length unavailable ({type(e).__name__}: {e})", file=sys.stderr)
+
     return result
 
 

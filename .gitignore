@@ -22,3 +22,6 @@ target/
 # Sparse-reconstruction archive: 534M of regeneratable scene data, same class as
 # assets/examples/ above
 assets/examples_sparse_archive/
+
+# Per-job pipeline snapshots written by topowall-splat (transient)
+.run_*.sh

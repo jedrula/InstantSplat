@@ -38,6 +38,41 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 # Override INSTANTSPLAT_PYTHON env var for non-default conda locations
 PYTHON="${INSTANTSPLAT_PYTHON:-${HOME}/miniconda3/envs/instantsplat/bin/python}"
 CONDA_BIN="$(dirname "$PYTHON")"
+# COLMAP binary for the SfM paths. DEFAULT IS 4.2.0 (the `colmap42` env), not the instantsplat
+# env's 4.0.4, measured 2026-09-07 on two 251/259-frame iPhone captures, version as the only
+# variable:
+#
+#   stage           4f280a9e            da329e40
+#   features        27 ->  10 s         28 ->  10 s
+#   matching       637 -> 294 s (-54%) 787 -> 326 s (-59%)
+#   global_mapper  118 -> 117 s        166 -> 172 s
+#   SfM TOTAL      798 -> 427 s (-46%) 991 -> 515 s (-48%)
+#   SfM points          +10.2%              +10.3%
+#
+# The win is 4.1.1's fix for a process-global OpenMP critical section in RANSAC/LORANSAC that
+# 4.0.0 introduced — which is why it lands entirely in matching/features with the mapper flat.
+# PSNR is neutral (+0.02 / +0.06 dB): this is a cost and correctness change, not a quality one.
+#
+# Kept separate from CONDA_BIN because localization must NOT follow: `localize_colmap.sh` has
+# to extract query descriptors with the same COLMAP that built the pod (GPU-SIFT descriptor
+# format changed between generations — a mismatch yields 0 verified pairs, silently), and every
+# pod built before 2026-09-07 used 4.0.4. The version actually used is written to
+# $MODEL_DIR/colmap_version.txt (the POD dir — localize_colmap.sh reads it there; SCENE_DIR is
+# reused scratch). Set COLMAP_BIN (env) or --colmap-bin to override.
+#
+# pycolmap 4.0.4 in the instantsplat env reads 4.2.0's output fine (verified: filter_sfm_outliers
+# and the scorers both ran against 4.2.0 models).
+COLMAP_BIN="${COLMAP_BIN:-${HOME}/miniconda3/envs/colmap42/bin/colmap}"
+# Deliberately NOT a fallback to 4.0.4: silently downgrading would produce pods that are 46%
+# slower and 10% sparser while every log says nothing, and the SfM-arm comparisons would be
+# confounded by a variable nobody set. Fail instead.
+if [[ ! -x "$COLMAP_BIN" ]]; then
+    echo "Error: COLMAP_BIN not executable: $COLMAP_BIN" >&2
+    echo "       Recreate with: conda create -n colmap42 -c conda-forge 'colmap=4.2.0=cuda_129*'" >&2
+    echo "                      conda install -n colmap42 -c conda-forge 'libopenimageio=3.1*'" >&2
+    echo "       (the colmap solve alone ships a broken env — libOpenImageIO.so.3.1 is missing)" >&2
+    exit 1
+fi
 ONTHEFLY_PYTHON="${ONTHEFLY_PYTHON:-${HOME}/miniconda3/envs/onthefly_nvs/bin/python}"
 ONTHEFLY_REPO="${ONTHEFLY_REPO:-${HOME}/workdir/on-the-fly-nvs}"
 
@@ -174,6 +209,7 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --colmap-ba)        COLMAP_BA=1;         shift ;;
         --colmap-matcher)   COLMAP_MATCHER="$2"; shift 2 ;;
+        --colmap-bin)       COLMAP_BIN="$2";     shift 2 ;;
         --camera-model)     CAMERA_MODEL="$2"; shift 2 ;;
         --camera-params)    CAMERA_PARAMS="$2"; shift 2 ;;
         --pose-opt)         POSE_OPT=1;          shift ;;
@@ -298,15 +334,26 @@ if [[ "$SFM" == "pose_prior" ]]; then
     esac
     # COLMAP 4.x only: 3.9.1 has no pose_prior_mapper and its SIFT descriptors are
     # incompatible with 4.x, so the whole chain must stay on one generation.
-    COLMAP4_BIN="${COLMAP4_BIN:-$CONDA_BIN/colmap}"
-    [[ -x "$COLMAP4_BIN" ]] || { echo "Error: COLMAP 4.x not found at $COLMAP4_BIN (set COLMAP4_BIN)"; exit 1; }
+
     _PP_OUT="$REPO/output_infer/${SCENE}_posePrior"
+    # arkit_pose_prior.py auto-picks vocab_tree above 300 images and reads the tree path from
+    # $VOCAB_TREE, which nothing exported -- so --sfm pose_prior aborted on every capture over
+    # 300 frames. Export it here, and forward --colmap-matcher so the caller can override the
+    # auto-pick (it matters: on b36e3755 vocab_tree left frames 250-449 with 6-8 pairs each
+    # against 31-58 elsewhere, and GLOMAP folded that stretch 13.6 m out of place).
+    export VOCAB_TREE="$REPO/assets/vocab_tree_faiss_flickr100K_words256K.bin"
+    if [[ ! -f "$VOCAB_TREE" ]]; then
+        echo "Error: vocab tree not found at $VOCAB_TREE"
+        echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
+        exit 1
+    fi
     echo ""
     echo "[0/3] Building preposed model from ARKit pose priors -> $_PP_OUT"
     "$PYTHON" "$REPO/arkit_pose_prior.py" \
         --images "$ARKIT_DIR/images" --traj "$ARKIT_DIR/frames.traj" \
         --pincam "$ARKIT_DIR/intrinsics.pincam" --out "$_PP_OUT" \
-        --prior-std "${PRIOR_STD:-0.01}" --colmap "$COLMAP4_BIN" || exit 1
+        ${COLMAP_MATCHER:+--matcher "$COLMAP_MATCHER"} \
+        --prior-std "${PRIOR_STD:-0.01}" --colmap "$COLMAP_BIN" || exit 1
     SFM="preposed_colmap"
     PREPOSED_DIR="$_PP_OUT"
 fi
@@ -487,6 +534,14 @@ echo "[2/3] SfM + 3DGS training (sfm=$SFM trainer=$TRAINER, $ITERS iters, $TOTAL
 mkdir -p "$MODEL_DIR"
 cd "$REPO"
 
+# Record which COLMAP built this pod. localize_colmap.sh reads it to extract query
+# descriptors with the SAME binary — GPU-SIFT descriptors are not comparable across COLMAP
+# generations, and a mismatch fails as "0 verified pairs" with no error.
+{
+    echo "$COLMAP_BIN"
+    QT_QPA_PLATFORM=offscreen "$COLMAP_BIN" help 2>&1 | head -1
+} > "$MODEL_DIR/colmap_version.txt"
+
 SFM_START=$(date +%s)
 if [[ "$SFM" == "fast3r" ]]; then
     INIT_GEO_ARGS=""
@@ -514,7 +569,7 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     # schema for the incremental mapper (mixing /usr/bin/colmap 3.9 broke GPU).
     echo "    Camera model: $CAMERA_MODEL"
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
-    "$CONDA_BIN/colmap" feature_extractor \
+    "$COLMAP_BIN" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model "$CAMERA_MODEL" \
@@ -534,7 +589,7 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     fi
     echo "    Matcher: $_MATCHER"
     if [[ "$_MATCHER" == "exhaustive" ]]; then
-        "$CONDA_BIN/colmap" exhaustive_matcher \
+        "$COLMAP_BIN" exhaustive_matcher \
             --database_path "$DB_PATH" \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_colmap_match.log"
@@ -546,20 +601,20 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
             echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
             exit 1
         fi
-        "$CONDA_BIN/colmap" vocab_tree_matcher \
+        "$COLMAP_BIN" vocab_tree_matcher \
             --database_path "$DB_PATH" \
             --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_colmap_match.log"
     else
-        "$CONDA_BIN/colmap" sequential_matcher \
+        "$COLMAP_BIN" sequential_matcher \
             --database_path "$DB_PATH" \
             --SequentialMatching.overlap 10 \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_colmap_match.log"
     fi
 
-    "$CONDA_BIN/colmap" mapper \
+    "$COLMAP_BIN" mapper \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --output_path "$SPARSE_PARENT" \
@@ -608,7 +663,7 @@ PYCOMP
         echo "    Undistorting images ($CAMERA_MODEL → PINHOLE)..."
         UNDIST_DIR="$SCENE_DIR/undistorted"
         rm -rf "$UNDIST_DIR"
-        "$CONDA_BIN/colmap" image_undistorter \
+        "$COLMAP_BIN" image_undistorter \
             --image_path "$IMAGE_DIR" \
             --input_path "$SPARSE_PARENT/0" \
             --output_path "$UNDIST_DIR" \
@@ -626,7 +681,7 @@ PYCOMP
     fi
 
     # Convert binary → text (cameras.txt, images.txt, points3D.txt) for train.py
-    "$CONDA_BIN/colmap" model_converter \
+    "$COLMAP_BIN" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
@@ -640,11 +695,11 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
     export QT_QPA_PLATFORM=offscreen
 
     # GLOMAP is deprecated upstream; its global mapper is now part of COLMAP 4.x.
-    # Use $CONDA_BIN/colmap throughout so features, matching, and global_mapper
+    # Use $COLMAP_BIN throughout so features, matching, and global_mapper
     # all share the same DB schema — no version mismatch, retriangulation works.
     echo "    Camera model: $CAMERA_MODEL"
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
-    "$CONDA_BIN/colmap" feature_extractor \
+    "$COLMAP_BIN" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model "$CAMERA_MODEL" \
@@ -663,7 +718,7 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
     fi
     echo "    Matcher: $_MATCHER"
     if [[ "$_MATCHER" == "exhaustive" ]]; then
-        "$CONDA_BIN/colmap" exhaustive_matcher \
+        "$COLMAP_BIN" exhaustive_matcher \
             --database_path "$DB_PATH" \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_glomap_match.log"
@@ -675,13 +730,13 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
             echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
             exit 1
         fi
-        "$CONDA_BIN/colmap" vocab_tree_matcher \
+        "$COLMAP_BIN" vocab_tree_matcher \
             --database_path "$DB_PATH" \
             --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_glomap_match.log"
     else
-        "$CONDA_BIN/colmap" sequential_matcher \
+        "$COLMAP_BIN" sequential_matcher \
             --database_path "$DB_PATH" \
             --SequentialMatching.overlap 10 \
             --FeatureMatching.use_gpu 1 \
@@ -690,12 +745,12 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
 
     if [[ "$VIEW_GRAPH_CALIBRATOR" == "1" ]]; then
         echo "    Running view_graph_calibrator (focal length estimation)..."
-        "$CONDA_BIN/colmap" view_graph_calibrator \
+        "$COLMAP_BIN" view_graph_calibrator \
             --database_path "$DB_PATH" \
             2>&1 | tee "$MODEL_DIR/01b2_glomap_vgc.log"
     fi
 
-    "$CONDA_BIN/colmap" global_mapper \
+    "$COLMAP_BIN" global_mapper \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --output_path "$SPARSE_PARENT" \
@@ -742,7 +797,7 @@ PYCOMP
         echo "    Undistorting images ($CAMERA_MODEL → PINHOLE)..."
         UNDIST_DIR="$SCENE_DIR/undistorted"
         rm -rf "$UNDIST_DIR"
-        "$CONDA_BIN/colmap" image_undistorter \
+        "$COLMAP_BIN" image_undistorter \
             --image_path "$IMAGE_DIR" \
             --input_path "$SPARSE_PARENT/0" \
             --output_path "$UNDIST_DIR" \
@@ -759,7 +814,7 @@ PYCOMP
         rm -rf "$UNDIST_DIR"
     fi
 
-    "$CONDA_BIN/colmap" model_converter \
+    "$COLMAP_BIN" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
@@ -793,7 +848,7 @@ elif [[ "$SFM" == "glomap_aliked" ]]; then
         "$HLOC_WORK" \
         --matcher aliked+lightglue \
         --pairs "$_HLOC_PAIRS" \
-        --colmap-bin "$CONDA_BIN/colmap" \
+        --colmap-bin "$COLMAP_BIN" \
         2>&1 | tee "$MODEL_DIR/01_glomap_aliked.log"
 
     if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
@@ -806,7 +861,7 @@ elif [[ "$SFM" == "glomap_aliked" ]]; then
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_aliked_filter.log"
 
-    "$CONDA_BIN/colmap" model_converter \
+    "$COLMAP_BIN" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
@@ -835,7 +890,7 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
         "$HLOC_WORK" \
         --matcher loftr_indoor \
         --pairs "$_HLOC_PAIRS" \
-        --colmap-bin "$CONDA_BIN/colmap" \
+        --colmap-bin "$COLMAP_BIN" \
         2>&1 | tee "$MODEL_DIR/01_glomap_loftr.log"
 
     if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
@@ -848,7 +903,7 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_loftr_filter.log"
 
-    "$CONDA_BIN/colmap" model_converter \
+    "$COLMAP_BIN" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
@@ -873,7 +928,7 @@ elif [[ "$SFM" == "glomap_dedode" ]]; then
         "$IMAGE_DIR" \
         "$HLOC_WORK" \
         $_FL_ARG \
-        --colmap-bin "$CONDA_BIN/colmap" \
+        --colmap-bin "$COLMAP_BIN" \
         2>&1 | tee "$MODEL_DIR/01_glomap_dedode.log"
 
     if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
@@ -886,7 +941,7 @@ elif [[ "$SFM" == "glomap_dedode" ]]; then
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_dedode_filter.log"
 
-    "$CONDA_BIN/colmap" model_converter \
+    "$COLMAP_BIN" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
@@ -926,7 +981,7 @@ elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "c
         --mapper "$_MAPPER" \
         --pairs "$_HLOC_PAIRS" \
         $_FL_ARG \
-        --colmap-bin "$CONDA_BIN/colmap" \
+        --colmap-bin "$COLMAP_BIN" \
         2>&1 | tee "$MODEL_DIR/01_${SFM}.log"
 
     if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
@@ -939,7 +994,7 @@ elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "c
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_${SFM}_filter.log"
 
-    "$CONDA_BIN/colmap" model_converter \
+    "$COLMAP_BIN" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
@@ -955,7 +1010,7 @@ elif [[ "$SFM" == "fastmap" ]]; then
     export QT_QPA_PLATFORM=offscreen
 
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
-    "$CONDA_BIN/colmap" feature_extractor \
+    "$COLMAP_BIN" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model PINHOLE \
@@ -974,7 +1029,7 @@ elif [[ "$SFM" == "fastmap" ]]; then
     fi
     echo "    Matcher: $_MATCHER"
     if [[ "$_MATCHER" == "exhaustive" ]]; then
-        "$CONDA_BIN/colmap" exhaustive_matcher \
+        "$COLMAP_BIN" exhaustive_matcher \
             --database_path "$DB_PATH" \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_fastmap_match.log"
@@ -985,13 +1040,13 @@ elif [[ "$SFM" == "fastmap" ]]; then
             echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
             exit 1
         fi
-        "$CONDA_BIN/colmap" vocab_tree_matcher \
+        "$COLMAP_BIN" vocab_tree_matcher \
             --database_path "$DB_PATH" \
             --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$MODEL_DIR/01b_fastmap_match.log"
     else
-        "$CONDA_BIN/colmap" sequential_matcher \
+        "$COLMAP_BIN" sequential_matcher \
             --database_path "$DB_PATH" \
             --SequentialMatching.overlap 10 \
             --FeatureMatching.use_gpu 1 \
@@ -1017,7 +1072,7 @@ elif [[ "$SFM" == "fastmap" ]]; then
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_fastmap_filter.log"
 
-    /usr/bin/colmap model_converter \
+    "$COLMAP_BIN" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
@@ -1238,7 +1293,7 @@ print(f'  → text→binary: {len(r.cameras)} cameras, {len(r.images)} images, {
         while read -r _img; do ln -sfn "$_img" "$SCENE_DIR/images/$(basename "$_img")"; done
     IMAGE_DIR="$SCENE_DIR/images"
 
-    /usr/bin/colmap model_converter \
+    "$COLMAP_BIN" model_converter \
         --input_path "$SPARSE_PARENT/0" \
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
@@ -1307,7 +1362,7 @@ else
     _PC_SRC="$SCENE_DIR/sparse_${TOTAL_FRAMES}/0"
 fi
 if [[ -d "$_PC_SRC" ]]; then
-    /usr/bin/colmap model_converter \
+    "$COLMAP_BIN" model_converter \
         --input_path "$_PC_SRC" \
         --output_path "$MODEL_DIR/sfm_pointcloud.ply" \
         --output_type PLY 2>/dev/null || true
