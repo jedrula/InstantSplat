@@ -100,6 +100,16 @@ VIEWER_PORT=""      # empty = disable viewer; set to a port number to enable vis
 ONTHEFLY_ITERS=30       # per-keyframe iterations for on-the-fly NVS (--sfm onthefly)
 COLMAP_BA=0
 COLMAP_MATCHER=""
+# --colmap-matcher spatial only. COLMAP's own defaults; max_distance is in metres
+# and is site-size dependent, so there is no universal right value — set it to the
+# radius over which two photos could plausibly see the same ground.
+SPATIAL_MAX_NEIGHBORS=50
+SPATIAL_MAX_DISTANCE=100
+# hloc retrieval neighbours per image for the learned-feature SfM paths (glomap_aliked etc.
+# with --colmap-matcher unset or vocab_tree). hloc's own default of 25 capped the Plac
+# Staszica run at 19,625 pairs and starved the trainer (obs/image 1204 -> 752, floaters
+# 1.07%% -> 3.92%%) even though it fixed registration. Raise it when the capture is large.
+HLOC_RETRIEVAL_K=25
 CAMERA_MODEL="PINHOLE"   # PINHOLE | SIMPLE_RADIAL | RADIAL | OPENCV — non-PINHOLE triggers undistortion after SfM
 # Known intrinsics, comma-separated, matching CAMERA_MODEL's parameter order
 # (PINHOLE: fx,fy,cx,cy). Empty = let COLMAP guess, which is its no-EXIF fallback
@@ -145,6 +155,38 @@ IMAGE_SIZE=256
 # unchanged; `--sfm-image-size 1920` makes it a real one-variable experiment.
 # NOT the same knob as --image-size, which is the MASt3R/Fast3R input size (256).
 SFM_MAX_IMAGE_SIZE=1600
+# Training resolution cap, passed to Brush as --max-resolution. Always passed explicitly so a
+# run records what it trained at instead of inheriting Brush's silent default.
+#
+# Default is 1920 — the same value Brush uses — and that is a MEASURED choice, not inertia.
+# On 2026-09-11 a 4-view comparison said 4096 was worth +0.25 dB and this default was briefly
+# set to 4096. Re-run on ALL 85 held-out views the next day, the effect disappeared and
+# reversed on the perceptual metrics (forks of ce453c25, resolution the only variable,
+# rendered to a matched 1600 px):
+#
+#   train res    PSNR     SSIM     LPIPS(lower better)
+#   1920        23.808   0.4957   0.7390
+#   3072        23.821   0.4892   0.7532
+#   4096        23.768   0.4836   0.7660
+#
+# PSNR spread is 0.054 dB (noise), while SSIM and LPIPS get monotonically WORSE as resolution
+# rises. The four views used the first time had been picked for high detail and vegetation, so
+# they were a biased subsample. Raising this also lowers the splat ceiling, since image buffers
+# take VRAM the splats then cannot have. Do not raise it again without a full-eval-set result.
+TRAIN_MAX_IMAGE_SIZE=1920
+# SIFT feature extraction on GPU (1) or CPU (0). SiftGPU allocates the whole image pyramid in
+# VRAM and dies with "CuTexImage::InitTexture2D: out of memory" above ~2400 px on the 8 GB 4060
+# Ti — every image FAILUREs and the pose graph comes out empty (measured 2026-09-08 on 25 MP
+# phone stills: 2400 ok, 3200 dead). CPU SIFT has no such ceiling: it reads 5760 px fine and
+# finds ~5x the features. So this is the only way to detect features above 2400 px on this box.
+# Matching stays on GPU either way — it consumes descriptors, not pixels.
+SFM_SIFT_GPU=1
+# CPU SIFT holds a full image pyramid PER THREAD, and COLMAP defaults to one thread per core.
+# Measured 2026-09-08 on 6 of these 25 MP stills at max_image_size 5760, 12 threads:
+# peak RSS 27.7 GB. On this 32 GB box that exhausted RAM and swap and took the :8002 server
+# down with the whole job queue. 4 threads is ~9 GB, which leaves room for everything else.
+# Not a knob: nothing wants to tune this, it just must not kill the machine.
+SFM_SIFT_CPU_THREADS=4
 # Brush densification stop. Brush's own default is the ABSOLUTE iteration 15000, chosen
 # against its default --total-steps 30000 — i.e. "stop growing at 50%, refine the back half".
 # Every 3DGS implementation uses that same 50% convention and the same absolute encoding:
@@ -209,6 +251,9 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --colmap-ba)        COLMAP_BA=1;         shift ;;
         --colmap-matcher)   COLMAP_MATCHER="$2"; shift 2 ;;
+        --spatial-max-neighbors) SPATIAL_MAX_NEIGHBORS="$2"; shift 2 ;;
+        --spatial-max-distance)  SPATIAL_MAX_DISTANCE="$2";  shift 2 ;;
+        --hloc-retrieval-k)      HLOC_RETRIEVAL_K="$2";      shift 2 ;;
         --colmap-bin)       COLMAP_BIN="$2";     shift 2 ;;
         --camera-model)     CAMERA_MODEL="$2"; shift 2 ;;
         --camera-params)    CAMERA_PARAMS="$2"; shift 2 ;;
@@ -224,6 +269,8 @@ while [[ $# -gt 0 ]]; do
         --no-densification)  NO_DENSIFICATION=1;  shift ;;
         --image-size)   IMAGE_SIZE="$2";   shift 2 ;;
         --sfm-image-size) SFM_MAX_IMAGE_SIZE="$2"; shift 2 ;;
+        --train-image-size) TRAIN_MAX_IMAGE_SIZE="$2"; shift 2 ;;
+        --sfm-sift-gpu) SFM_SIFT_GPU="$2"; shift 2 ;;
         --growth-stop) GROWTH_STOP="$2"; shift 2 ;;
         --model-dir)    MODEL_DIR_OVERRIDE="$2"; shift 2 ;;
         --preposed-dir) PREPOSED_DIR="$2";      shift 2 ;;
@@ -245,6 +292,19 @@ done
 # straight into the COLMAP command line at three call sites.
 if ! [[ "$SFM_MAX_IMAGE_SIZE" =~ ^[0-9]+$ ]] || (( SFM_MAX_IMAGE_SIZE <= 0 )); then
     echo "Error: --sfm-image-size must be a positive integer (got '$SFM_MAX_IMAGE_SIZE')"; exit 1
+fi
+
+if ! [[ "$TRAIN_MAX_IMAGE_SIZE" =~ ^[0-9]+$ ]] || (( TRAIN_MAX_IMAGE_SIZE <= 0 )); then
+    echo "Error: --train-image-size must be a positive integer (got '$TRAIN_MAX_IMAGE_SIZE')"; exit 1
+fi
+
+if [[ "$SFM_SIFT_GPU" != "0" && "$SFM_SIFT_GPU" != "1" ]]; then
+    echo "Error: --sfm-sift-gpu must be 0 or 1 (got '$SFM_SIFT_GPU')"; exit 1
+fi
+
+_SIFT_THREAD_ARG=()
+if [[ "$SFM_SIFT_GPU" == "0" ]]; then
+    _SIFT_THREAD_ARG=(--FeatureExtraction.num_threads "$SFM_SIFT_CPU_THREADS")
 fi
 
 # Resolve --growth-stop to a concrete iteration. Done after ITERS is known.
@@ -528,6 +588,80 @@ PIPELINE_START=$(date +%s)
 
 emit_event "{\"event\":\"frames_extracted\",\"total_frames\":$TOTAL_FRAMES}"
 
+# ── COLMAP feature matching ──────────────────────────────────────────────────
+# One dispatch for every COLMAP-matching SfM path (colmap_sift, glomap_sift,
+# fastmap). $1 is the log basename so each path keeps its own 01b_*.log.
+run_matcher() {
+    local _log="$MODEL_DIR/$1"
+    # Resolve matcher: explicit flag > auto (exhaustive <=150 frames, else vocab_tree).
+    local _MATCHER="${COLMAP_MATCHER}"
+    if [[ -z "$_MATCHER" ]]; then
+        # NEVER fall back to bare sequential: no loop closure starves the view graph on
+        # non-sequential/revisiting captures -> GLOMAP global scale-drift/fold (playroom
+        # 2026-07-25, experiments/glomap_vs_reference_playroom/FINDINGS.md).
+        if (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
+    fi
+    echo "    Matcher: $_MATCHER"
+    case "$_MATCHER" in
+    exhaustive)
+        "$COLMAP_BIN" exhaustive_matcher \
+            --database_path "$DB_PATH" \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$_log"
+        ;;
+    vocab_tree)
+        # COLMAP 4.x uses faiss (not flann) — needs the faiss-format tree
+        local VOCAB_TREE="$REPO/assets/vocab_tree_faiss_flickr100K_words256K.bin"
+        if [[ ! -f "$VOCAB_TREE" ]]; then
+            echo "Error: vocab tree not found at $VOCAB_TREE"
+            echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
+            exit 1
+        fi
+        "$COLMAP_BIN" vocab_tree_matcher \
+            --database_path "$DB_PATH" \
+            --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$_log"
+        ;;
+    spatial)
+        # Pairs by 3-D proximity from the pose_priors table instead of by appearance.
+        # COLMAP 4.2.0's feature_extractor fills that table from EXIF GPS with no extra
+        # step, so any GPS-tagged capture (every DJI photo) gets this for free.
+        # For aerial work this is the right pair selector: a nadir grid over repetitive
+        # ground defeats appearance retrieval, but the drone knew where it was.
+        # ignore_z=1 (COLMAP's default) is correct here — it pairs an 8 m dome shot with a
+        # 40 m grid shot over the same ground, which is exactly the link we want.
+        # Hard-fail rather than silently matching nothing when the priors are absent.
+        local _NPRIOR
+        _NPRIOR=$("$PYTHON" -c "import sqlite3,sys; print(sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True).execute('select count(*) from pose_priors').fetchone()[0])" "$DB_PATH" 2>/dev/null || echo 0)
+        if (( _NPRIOR < TOTAL_FRAMES )); then
+            echo "Error: --colmap-matcher spatial needs a position prior per image;"
+            echo "       the database has $_NPRIOR for $TOTAL_FRAMES images."
+            echo "       Only GPS-tagged (or otherwise prior-seeded) captures can use it."
+            exit 1
+        fi
+        "$COLMAP_BIN" spatial_matcher \
+            --database_path "$DB_PATH" \
+            --SpatialMatching.max_num_neighbors "$SPATIAL_MAX_NEIGHBORS" \
+            --SpatialMatching.max_distance "$SPATIAL_MAX_DISTANCE" \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$_log"
+        ;;
+    sequential)
+        "$COLMAP_BIN" sequential_matcher \
+            --database_path "$DB_PATH" \
+            --SequentialMatching.overlap 10 \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$_log"
+        ;;
+    *)
+        echo "Error: unknown --colmap-matcher '$_MATCHER'"
+        echo "       expected one of: exhaustive | vocab_tree | spatial | sequential"
+        exit 1
+        ;;
+    esac
+}
+
 # ── Step 2: geometry init + 3DGS training ────────────────────────────────────
 echo ""
 echo "[2/3] SfM + 3DGS training (sfm=$SFM trainer=$TRAINER, $ITERS iters, $TOTAL_FRAMES frames)..."
@@ -540,6 +674,7 @@ cd "$REPO"
 {
     echo "$COLMAP_BIN"
     QT_QPA_PLATFORM=offscreen "$COLMAP_BIN" help 2>&1 | head -1
+    echo "sift_gpu=$SFM_SIFT_GPU"
 } > "$MODEL_DIR/colmap_version.txt"
 
 SFM_START=$(date +%s)
@@ -569,50 +704,19 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     # schema for the incremental mapper (mixing /usr/bin/colmap 3.9 broke GPU).
     echo "    Camera model: $CAMERA_MODEL"
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
+    echo "    Feature extractor: $([[ "$SFM_SIFT_GPU" == 1 ]] && echo GPU || echo CPU) SIFT"
     "$COLMAP_BIN" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model "$CAMERA_MODEL" \
         --ImageReader.single_camera 1 \
         "${_CAM_PARAMS_ARG[@]}" \
-        --FeatureExtraction.use_gpu 1 \
+        --FeatureExtraction.use_gpu "$SFM_SIFT_GPU" \
+        "${_SIFT_THREAD_ARG[@]}" \
         --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
         2>&1 | tee "$MODEL_DIR/01a_colmap_features.log"
 
-    # Resolve matcher: explicit flag > auto (exhaustive ≤150 frames, else vocab_tree; never bare sequential)
-    _MATCHER="${COLMAP_MATCHER}"
-    if [[ -z "$_MATCHER" ]]; then
-        # NEVER fall back to bare sequential: no loop closure starves the view graph on
-        # non-sequential/revisiting captures -> GLOMAP global scale-drift/fold (playroom
-        # 2026-07-25, experiments/glomap_vs_reference_playroom/FINDINGS.md).
-        if (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
-    fi
-    echo "    Matcher: $_MATCHER"
-    if [[ "$_MATCHER" == "exhaustive" ]]; then
-        "$COLMAP_BIN" exhaustive_matcher \
-            --database_path "$DB_PATH" \
-            --FeatureMatching.use_gpu 1 \
-            2>&1 | tee "$MODEL_DIR/01b_colmap_match.log"
-    elif [[ "$_MATCHER" == "vocab_tree" ]]; then
-        # COLMAP 4.x uses faiss (not flann) — needs the faiss-format tree
-        VOCAB_TREE="$REPO/assets/vocab_tree_faiss_flickr100K_words256K.bin"
-        if [[ ! -f "$VOCAB_TREE" ]]; then
-            echo "Error: vocab tree not found at $VOCAB_TREE"
-            echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
-            exit 1
-        fi
-        "$COLMAP_BIN" vocab_tree_matcher \
-            --database_path "$DB_PATH" \
-            --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
-            --FeatureMatching.use_gpu 1 \
-            2>&1 | tee "$MODEL_DIR/01b_colmap_match.log"
-    else
-        "$COLMAP_BIN" sequential_matcher \
-            --database_path "$DB_PATH" \
-            --SequentialMatching.overlap 10 \
-            --FeatureMatching.use_gpu 1 \
-            2>&1 | tee "$MODEL_DIR/01b_colmap_match.log"
-    fi
+    run_matcher 01b_colmap_match.log
 
     "$COLMAP_BIN" mapper \
         --database_path "$DB_PATH" \
@@ -699,49 +803,19 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
     # all share the same DB schema — no version mismatch, retriangulation works.
     echo "    Camera model: $CAMERA_MODEL"
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
+    echo "    Feature extractor: $([[ "$SFM_SIFT_GPU" == 1 ]] && echo GPU || echo CPU) SIFT"
     "$COLMAP_BIN" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model "$CAMERA_MODEL" \
         --ImageReader.single_camera 1 \
         "${_CAM_PARAMS_ARG[@]}" \
-        --FeatureExtraction.use_gpu 1 \
+        --FeatureExtraction.use_gpu "$SFM_SIFT_GPU" \
+        "${_SIFT_THREAD_ARG[@]}" \
         --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
         2>&1 | tee "$MODEL_DIR/01a_glomap_features.log"
 
-    _MATCHER="${COLMAP_MATCHER}"
-    if [[ -z "$_MATCHER" ]]; then
-        # NEVER fall back to bare sequential: no loop closure starves the view graph on
-        # non-sequential/revisiting captures -> GLOMAP global scale-drift/fold (playroom
-        # 2026-07-25, experiments/glomap_vs_reference_playroom/FINDINGS.md).
-        if (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
-    fi
-    echo "    Matcher: $_MATCHER"
-    if [[ "$_MATCHER" == "exhaustive" ]]; then
-        "$COLMAP_BIN" exhaustive_matcher \
-            --database_path "$DB_PATH" \
-            --FeatureMatching.use_gpu 1 \
-            2>&1 | tee "$MODEL_DIR/01b_glomap_match.log"
-    elif [[ "$_MATCHER" == "vocab_tree" ]]; then
-        # COLMAP 4.x uses faiss (not flann) — needs the faiss-format tree
-        VOCAB_TREE="$REPO/assets/vocab_tree_faiss_flickr100K_words256K.bin"
-        if [[ ! -f "$VOCAB_TREE" ]]; then
-            echo "Error: vocab tree not found at $VOCAB_TREE"
-            echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
-            exit 1
-        fi
-        "$COLMAP_BIN" vocab_tree_matcher \
-            --database_path "$DB_PATH" \
-            --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
-            --FeatureMatching.use_gpu 1 \
-            2>&1 | tee "$MODEL_DIR/01b_glomap_match.log"
-    else
-        "$COLMAP_BIN" sequential_matcher \
-            --database_path "$DB_PATH" \
-            --SequentialMatching.overlap 10 \
-            --FeatureMatching.use_gpu 1 \
-            2>&1 | tee "$MODEL_DIR/01b_glomap_match.log"
-    fi
+    run_matcher 01b_glomap_match.log
 
     if [[ "$VIEW_GRAPH_CALIBRATOR" == "1" ]]; then
         echo "    Running view_graph_calibrator (focal length estimation)..."
@@ -848,6 +922,7 @@ elif [[ "$SFM" == "glomap_aliked" ]]; then
         "$HLOC_WORK" \
         --matcher aliked+lightglue \
         --pairs "$_HLOC_PAIRS" \
+        --retrieval-k "$HLOC_RETRIEVAL_K" \
         --colmap-bin "$COLMAP_BIN" \
         2>&1 | tee "$MODEL_DIR/01_glomap_aliked.log"
 
@@ -890,6 +965,7 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
         "$HLOC_WORK" \
         --matcher loftr_indoor \
         --pairs "$_HLOC_PAIRS" \
+        --retrieval-k "$HLOC_RETRIEVAL_K" \
         --colmap-bin "$COLMAP_BIN" \
         2>&1 | tee "$MODEL_DIR/01_glomap_loftr.log"
 
@@ -980,6 +1056,7 @@ elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "c
         --matcher "$_MATCHER" \
         --mapper "$_MAPPER" \
         --pairs "$_HLOC_PAIRS" \
+        --retrieval-k "$HLOC_RETRIEVAL_K" \
         $_FL_ARG \
         --colmap-bin "$COLMAP_BIN" \
         2>&1 | tee "$MODEL_DIR/01_${SFM}.log"
@@ -1010,48 +1087,19 @@ elif [[ "$SFM" == "fastmap" ]]; then
     export QT_QPA_PLATFORM=offscreen
 
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
+    echo "    Feature extractor: $([[ "$SFM_SIFT_GPU" == 1 ]] && echo GPU || echo CPU) SIFT"
     "$COLMAP_BIN" feature_extractor \
         --database_path "$DB_PATH" \
         --image_path "$IMAGE_DIR" \
         --ImageReader.camera_model PINHOLE \
         --ImageReader.single_camera 1 \
         "${_CAM_PARAMS_ARG[@]}" \
-        --FeatureExtraction.use_gpu 1 \
+        --FeatureExtraction.use_gpu "$SFM_SIFT_GPU" \
+        "${_SIFT_THREAD_ARG[@]}" \
         --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
         2>&1 | tee "$MODEL_DIR/01a_fastmap_features.log"
 
-    _MATCHER="${COLMAP_MATCHER}"
-    if [[ -z "$_MATCHER" ]]; then
-        # NEVER fall back to bare sequential: no loop closure starves the view graph on
-        # non-sequential/revisiting captures -> GLOMAP global scale-drift/fold (playroom
-        # 2026-07-25, experiments/glomap_vs_reference_playroom/FINDINGS.md).
-        if (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
-    fi
-    echo "    Matcher: $_MATCHER"
-    if [[ "$_MATCHER" == "exhaustive" ]]; then
-        "$COLMAP_BIN" exhaustive_matcher \
-            --database_path "$DB_PATH" \
-            --FeatureMatching.use_gpu 1 \
-            2>&1 | tee "$MODEL_DIR/01b_fastmap_match.log"
-    elif [[ "$_MATCHER" == "vocab_tree" ]]; then
-        VOCAB_TREE="$REPO/assets/vocab_tree_faiss_flickr100K_words256K.bin"
-        if [[ ! -f "$VOCAB_TREE" ]]; then
-            echo "Error: vocab tree not found at $VOCAB_TREE"
-            echo "Download with: wget -O $VOCAB_TREE https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin"
-            exit 1
-        fi
-        "$COLMAP_BIN" vocab_tree_matcher \
-            --database_path "$DB_PATH" \
-            --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
-            --FeatureMatching.use_gpu 1 \
-            2>&1 | tee "$MODEL_DIR/01b_fastmap_match.log"
-    else
-        "$COLMAP_BIN" sequential_matcher \
-            --database_path "$DB_PATH" \
-            --SequentialMatching.overlap 10 \
-            --FeatureMatching.use_gpu 1 \
-            2>&1 | tee "$MODEL_DIR/01b_fastmap_match.log"
-    fi
+    run_matcher 01b_fastmap_match.log
 
     FASTMAP_DIR="${FASTMAP_DIR:-/home/communications/workdir/fastmap}"
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" "$FASTMAP_DIR/run.py" \
@@ -1616,7 +1664,7 @@ elif [[ "$TRAINER" == "brush" ]]; then
        "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && \
        "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && \
         ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
-    BRUSH_BIN="${BRUSH_BIN:-/home/communications/workdir/brush/brush-app-x86_64-unknown-linux-gnu/brush_app}"
+    BRUSH_BIN="${BRUSH_BIN:-/home/communications/workdir/brush-main/bin/brush-521}"
     BRUSH_OUT="$MODEL_DIR/brush_output"
     mkdir -p "$BRUSH_OUT"
     # For preposed: pass MODEL_DIR (has sparse/ but NOT transforms.json) so brush
@@ -1633,10 +1681,34 @@ elif [[ "$TRAINER" == "brush" ]]; then
     # "Device::poll: Validation Error" -> burn-fusion panic -> exit 134 (killed
     # jobs 787e1895 @13801 iters/6.86M splats and 203803d1 @6.62M on 2026-08-17).
     # Long runs hit it first because growth only stops at --growth-stop-iter 15000.
+    #
+    # That ~6.9M figure DOES NOT TRANSFER — the ceiling depends on the dataset, because
+    # images and their buffers hold VRAM the splats then cannot have. On 785 images at
+    # 1920 wgpu OOMed at 2,682,703 splats (job 3e22e000, 2026-09-11, --max-splats 5000000
+    # never reached). So on a large capture this default is not a safety margin, it is roughly
+    # the hardware limit. Measure before raising it for a given dataset.
+    #
+    # 2026-09-14: that 2,682,703 was measured while SAM2 (744 MiB) and the hold embedder
+    # (502 MiB) sat resident. Both now load on demand and release after 300 s idle, leaving
+    # 248 MiB, and the ceiling moved to 3,273,841 (job 72c3b406, --max-splats 6000000). The
+    # default below sits under that with room for SAM2 to reload mid-run if someone segments
+    # a hold: ~1.7 KB of VRAM per splat, so SAM2's ~500 MiB is worth ~0.29M splats.
+    #
+    # 2026-09-15: 2,900,000 was still too tight. Seven of eight 4x4 tiles reached it, but
+    # g4x4_30000_22 (352d6933) OOMed at 2,699,071 -- the SAME cell reached 2.9M at 15k, and a
+    # neighbouring cell with MORE images finished at 30k, so this was transient headroom, not a
+    # dataset limit. Losing a 50-minute run for the last 200k splats is a bad trade, so the
+    # default now sits just under the observed failure rather than just under the measured
+    # ceiling. Raise it per-dataset with BRUSH_MAX_SPLATS once you have measured that dataset.
     # Override with BRUSH_MAX_SPLATS=N, or an explicit --max-splats in
     # --brush-extra-args (checked here so we never pass the flag twice).
     if [[ " ${_BRUSH_EXTRA[*]} " != *" --max-splats "* && " ${_BRUSH_EXTRA[*]} " != *" --max-splats="* ]]; then
-        _BRUSH_EXTRA+=(--max-splats "${BRUSH_MAX_SPLATS:-2500000}")
+        _BRUSH_EXTRA+=(--max-splats "${BRUSH_MAX_SPLATS:-2700000}")
+    fi
+    # Training resolution. Always passed explicitly so the run records what it trained at
+    # instead of inheriting Brush's silent 1920 default. Skipped when the caller set it.
+    if [[ " ${_BRUSH_EXTRA[*]} " != *" --max-resolution "* && " ${_BRUSH_EXTRA[*]} " != *" --max-resolution="* ]]; then
+        _BRUSH_EXTRA+=(--max-resolution "$TRAIN_MAX_IMAGE_SIZE")
     fi
     # Densification stop. Without this Brush keeps its absolute 15000 default, which for any
     # run shorter than that means growth NEVER stops and the model gets no refinement phase
@@ -1648,13 +1720,28 @@ elif [[ "$TRAINER" == "brush" ]]; then
         _BRUSH_EXTRA+=(--growth-stop-iter "$_GROWTH_STOP_ITER")
         echo "    Growth stops at iter $_GROWTH_STOP_ITER (--growth-stop=$GROWTH_STOP, total $ITERS)"
     fi
+    # Record the flags Brush actually received. Brush logs neither its command line nor the
+    # resolution it loaded at, so without this there is no way to confirm afterwards that a
+    # run honoured --max-resolution (or any other extra flag) — the 2026-09-11 resolution
+    # sweep had to be argued from training times instead of read off a log.
+    echo "    Brush flags: --total-train-iters $ITERS --eval-split-every 8 ${_BRUSH_EXTRA[*]}"
     RUST_LOG=brush_cli=info "$BRUSH_BIN" "$_BRUSH_SCENE" \
-        --total-steps "$ITERS" \
+        --total-train-iters "$ITERS" \
         --export-path "$BRUSH_OUT" \
         --export-every "$ITERS" \
         --eval-split-every 8 \
         "${_BRUSH_EXTRA[@]}" \
         2>&1 | tee "$MODEL_DIR/02_train.log"
+    # Brush exits 0 even when its trainer thread panics — it prints "Done training! Took 0ns"
+    # and returns success, so `set -eo pipefail` cannot see the failure (job 64d6e546,
+    # --lpips-loss-weight 0.1, panicked inside burn-dispatch and sailed straight into
+    # ply2splat with an empty path). The export is the only honest signal that training ran.
+    if ! compgen -G "$BRUSH_OUT/export_*.ply" > /dev/null; then
+        echo "Error: Brush exported no PLY to $BRUSH_OUT — training did not complete." >&2
+        echo "       Last lines of $MODEL_DIR/02_train.log:" >&2
+        tail -5 "$MODEL_DIR/02_train.log" >&2
+        exit 1
+    fi
     SPARSE_PARENT="$SCENE_DIR/sparse"
     python3 "$REPO/camera_from_colmap.py" \
         --sparse     "$SPARSE_PARENT/0" \
