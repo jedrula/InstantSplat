@@ -86,7 +86,7 @@ SMART_FRAMES=0
 SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
-SFM="mast3r"       # mast3r | fast3r | pose_prior | colmap_sift | glomap_sift | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | glomap_dedode | colmap_aliked | fastmap | realityscan | onthefly
+SFM="mast3r"       # mast3r | fast3r | pose_prior | colmap_sift | glomap_sift | glomap_loma | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | glomap_dedode | colmap_aliked | fastmap | realityscan | onthefly
 TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat | onthefly | brush
 LANGSPLAT=0         # 1 = run LangSplat pipeline after training
 LANGSPLAT_ITERS=3000
@@ -147,7 +147,7 @@ NO_DENSIFICATION=0
 FRAMES_ONLY=0
 SKIP_EXTRACTION=0
 IMAGE_SIZE=256
-# COLMAP feature-extraction resolution cap for the SIFT paths (glomap_sift,
+# COLMAP feature-extraction resolution cap for the COLMAP-feature paths (glomap_sift, glomap_loma,
 # colmap_sift, fastmap). This was a hardcoded 1600 literal at all three call
 # sites, so `--image-size` never reached them and SfM resolution was not a
 # controllable variable: natively 1920x1440 uploads had their keypoints detected
@@ -181,6 +181,10 @@ TRAIN_MAX_IMAGE_SIZE=1920
 # finds ~5x the features. So this is the only way to detect features above 2400 px on this box.
 # Matching stays on GPU either way — it consumes descriptors, not pixels.
 SFM_SIFT_GPU=1
+# LoMa keypoints per image (--sfm glomap_loma). 2048 is COLMAP's own default, passed explicitly
+# so a run records it. SIFT keeps ~6k/img at 1600, so 2048 seeds ~58% fewer SfM points and
+# ~27% fewer gaussians (4f280a9e, 2026-09-29) -- the first knob to turn in a LoMa experiment.
+LOMA_MAX_FEATURES=2048
 # CPU SIFT holds a full image pyramid PER THREAD, and COLMAP defaults to one thread per core.
 # Measured 2026-09-08 on 6 of these 25 MP stills at max_image_size 5760, 12 threads:
 # peak RSS 27.7 GB. On this 32 GB box that exhausted RAM and swap and took the :8002 server
@@ -271,6 +275,7 @@ while [[ $# -gt 0 ]]; do
         --sfm-image-size) SFM_MAX_IMAGE_SIZE="$2"; shift 2 ;;
         --train-image-size) TRAIN_MAX_IMAGE_SIZE="$2"; shift 2 ;;
         --sfm-sift-gpu) SFM_SIFT_GPU="$2"; shift 2 ;;
+        --loma-max-features) LOMA_MAX_FEATURES="$2"; shift 2 ;;
         --growth-stop) GROWTH_STOP="$2"; shift 2 ;;
         --model-dir)    MODEL_DIR_OVERRIDE="$2"; shift 2 ;;
         --preposed-dir) PREPOSED_DIR="$2";      shift 2 ;;
@@ -301,6 +306,22 @@ fi
 
 if [[ "$SFM_SIFT_GPU" != "0" && "$SFM_SIFT_GPU" != "1" ]]; then
     echo "Error: --sfm-sift-gpu must be 0 or 1 (got '$SFM_SIFT_GPU')"; exit 1
+fi
+
+if ! [[ "$LOMA_MAX_FEATURES" =~ ^[0-9]+$ ]] || (( LOMA_MAX_FEATURES <= 0 )); then
+    echo "Error: --loma-max-features must be a positive integer (got '$LOMA_MAX_FEATURES')"; exit 1
+fi
+
+# COLMAP 4.2.0's learned features (ONNX; needs cuDNN in the colmap42 env). Set ONLY by
+# --sfm glomap_loma, never inherited from the environment: a stray FEATURE_TYPE would
+# silently turn a SIFT run into something else.
+FEATURE_TYPE=""; MATCHING_TYPE=""; _LOMA_ARGS=()
+if [[ "$SFM" == "glomap_loma" ]]; then
+    FEATURE_TYPE="LOMA_B"; MATCHING_TYPE="LOMA_B"
+    # ONE extraction thread: each thread opens its own ONNX session, and a single LoMa-B
+    # session (DINOv2-G descriptor) already peaks at 7.5 GB on the 8 GB card at 1024 px.
+    # 1600 px OOMs there even with bf16 -- pass --sfm-image-size 1024 on that card.
+    _LOMA_ARGS=(--FeatureExtraction.num_threads 1 --LomaExtraction.max_num_features "$LOMA_MAX_FEATURES")
 fi
 
 _SIFT_THREAD_ARG=()
@@ -606,7 +627,7 @@ emit_event "{\"event\":\"frames_extracted\",\"total_frames\":$TOTAL_FRAMES}"
 run_feature_extraction() {
     local _log="$1"
     local _FEAT_TYPE_ARG=()
-    [[ -n "${FEATURE_TYPE:-}" ]] && _FEAT_TYPE_ARG=(--FeatureExtraction.type "$FEATURE_TYPE")
+    [[ -n "$FEATURE_TYPE" ]] && _FEAT_TYPE_ARG=(--FeatureExtraction.type "$FEATURE_TYPE" "${_LOMA_ARGS[@]}")
     local _GROUPS_JSON="$SCENE_DIR/camera_groups.json"
 
     if [[ -f "$_GROUPS_JSON" ]]; then
@@ -659,13 +680,25 @@ run_matcher() {
         # NEVER fall back to bare sequential: no loop closure starves the view graph on
         # non-sequential/revisiting captures -> GLOMAP global scale-drift/fold (playroom
         # 2026-07-25, experiments/glomap_vs_reference_playroom/FINDINGS.md).
-        if (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
+        if [[ -n "$FEATURE_TYPE" ]]; then _MATCHER="exhaustive"   # vocab tree is SIFT-only, see below
+        elif (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
     fi
     echo "    Matcher: $_MATCHER"
+    # Descriptor matcher, for every pair selector below. Learned features need their own
+    # matcher (LOMA_B features + LOMA_B matcher); COLMAP's default is SIFT_BRUTEFORCE.
+    local _MATCH_TYPE_ARG=()
+    [[ -n "$MATCHING_TYPE" ]] && _MATCH_TYPE_ARG=(--FeatureMatching.type "$MATCHING_TYPE")
+    # The faiss vocab tree is built on 128-d SIFT descriptors; COLMAP 4.2.0 aborts on LoMa's
+    # 256-d ones (visual_index.cc: kDescDim 256 vs 128). sequential_loop queries it too.
+    if [[ -n "$FEATURE_TYPE" && ( "$_MATCHER" == "vocab_tree" || "$_MATCHER" == "sequential_loop" ) ]]; then
+        echo "Error: --colmap-matcher $_MATCHER needs SIFT descriptors; --sfm $SFM uses $FEATURE_TYPE"
+        echo "       use exhaustive | spatial | sequential"; exit 1
+    fi
     case "$_MATCHER" in
     exhaustive)
         "$COLMAP_BIN" exhaustive_matcher \
             --database_path "$DB_PATH" \
+            "${_MATCH_TYPE_ARG[@]}" \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$_log"
         ;;
@@ -679,6 +712,7 @@ run_matcher() {
         fi
         "$COLMAP_BIN" vocab_tree_matcher \
             --database_path "$DB_PATH" \
+            "${_MATCH_TYPE_ARG[@]}" \
             --VocabTreeMatching.vocab_tree_path "$VOCAB_TREE" \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$_log"
@@ -702,6 +736,7 @@ run_matcher() {
         fi
         "$COLMAP_BIN" spatial_matcher \
             --database_path "$DB_PATH" \
+            "${_MATCH_TYPE_ARG[@]}" \
             --SpatialMatching.max_num_neighbors "$SPATIAL_MAX_NEIGHBORS" \
             --SpatialMatching.max_distance "$SPATIAL_MAX_DISTANCE" \
             --FeatureMatching.use_gpu 1 \
@@ -710,6 +745,7 @@ run_matcher() {
     sequential)
         "$COLMAP_BIN" sequential_matcher \
             --database_path "$DB_PATH" \
+            "${_MATCH_TYPE_ARG[@]}" \
             --SequentialMatching.overlap 10 \
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$_log"
@@ -734,8 +770,6 @@ run_matcher() {
             echo "Error: sequential_loop needs the vocabulary tree at $VOCAB_TREE"
             exit 1
         fi
-        _MATCH_TYPE_ARG=()
-        [[ -n "${MATCHING_TYPE:-}" ]] && _MATCH_TYPE_ARG=(--FeatureMatching.type "$MATCHING_TYPE")
         "$COLMAP_BIN" sequential_matcher \
             --database_path "$DB_PATH" \
             "${_MATCH_TYPE_ARG[@]}" \
@@ -799,10 +833,8 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     echo "    Camera model: $CAMERA_MODEL"
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
     echo "    Feature extractor: $([[ "$SFM_SIFT_GPU" == 1 ]] && echo GPU || echo CPU) SIFT"
-    # COLMAP 4.2.0 does learned features itself, through ONNX, with no hloc and no PyTorch:
-    # SIFT (default), ALIKED, and LoMa. $FEATURE_TYPE selects it; empty keeps SIFT, so every
-    # existing capture runs byte-identically. Our ALIKED arm previously died with
-    # torch.OutOfMemoryError inside hloc's LightGlue, which this path avoids entirely.
+    # COLMAP 4.2.0 also does learned features itself, through ONNX, with no hloc and no
+    # PyTorch -- that is --sfm glomap_loma. This incremental path always runs SIFT.
     run_feature_extraction 01a_colmap_features.log
 
     run_matcher 01b_colmap_match.log
@@ -879,7 +911,7 @@ PYCOMP
         --output_path "$SPARSE_PARENT/0" \
         --output_type TXT \
         2>&1 | tee "$MODEL_DIR/01e_colmap_convert.log"
-elif [[ "$SFM" == "glomap_sift" ]]; then
+elif [[ "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" ]]; then
     echo "[2/3] COLMAP features + matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
     DB_PATH="$SCENE_DIR/database.db"
     SPARSE_PARENT="$SCENE_DIR/sparse"
@@ -892,7 +924,7 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
     # all share the same DB schema — no version mismatch, retriangulation works.
     echo "    Camera model: $CAMERA_MODEL"
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
-    echo "    Feature extractor: $([[ "$SFM_SIFT_GPU" == 1 ]] && echo GPU || echo CPU) SIFT"
+    echo "    Feature extractor: $([[ "$SFM_SIFT_GPU" == 1 ]] && echo GPU || echo CPU) ${FEATURE_TYPE:-SIFT}${FEATURE_TYPE:+ (max $LOMA_MAX_FEATURES/img)}"
     run_feature_extraction 01a_glomap_features.log
 
     run_matcher 01b_glomap_match.log
@@ -1484,7 +1516,7 @@ else
         2>&1 | tee "$MODEL_DIR/01_init_geo.log"
 fi
 # Export sparse point cloud as PLY for browser preview
-if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
     _PC_SRC="$SCENE_DIR/sparse/0"
 else
     _PC_SRC="$SCENE_DIR/sparse_${TOTAL_FRAMES}/0"
@@ -1497,7 +1529,7 @@ if [[ -d "$_PC_SRC" ]]; then
 fi
 
 # Copy COLMAP sparse into pod so it is self-contained for LichtFeld / re-training
-if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || \
+if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || \
       "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
       "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
     if [[ -d "$SPARSE_PARENT" ]]; then
@@ -1604,7 +1636,7 @@ elif [[ "$TRAINER" == "splatfacto" ]]; then
     fi
 elif [[ "$TRAINER" == "pgsr" ]]; then
     # For mast3r/fast3r, symlink sparse → sparse_N so sparse/0/ exists.
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_loma" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     # PGSR looks for sparse/images.bin (no 0/ subdir) — symlink files up from sparse/0/
     for _f in cameras.txt images.txt points3D.txt cameras.bin images.bin points3D.bin; do
         [[ -f "$SCENE_DIR/sparse/0/$_f" ]] && \
@@ -1633,7 +1665,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
     # gsplat via InstantSplat/simple_trainer.py — already proven on this 8GB machine
     # preposed: force MCMC (default strategy FPEs during densification with dense PLY init)
     [[ "$SFM" == "preposed" || "$SFM" == "preposed_colmap" ]] && MCMC=1
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_loma" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames, mcmc=$MCMC, post_processing=${GSPLAT_POST_PROCESSING:-none})..."
     _GSPLAT_PP_ARGS=()
@@ -1708,7 +1740,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         --out        "$MODEL_DIR/initial_camera.json" \
         2>/dev/null || true
 elif [[ "$TRAINER" == "2dgs" ]]; then
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_loma" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     _GS_REFINE_STOP=$(( ITERS / 2 ))
     echo "[2/3] 2DGS training ($ITERS iterations, $TOTAL_FRAMES frames)..."
@@ -1739,7 +1771,7 @@ elif [[ "$TRAINER" == "2dgs" ]]; then
 elif [[ "$TRAINER" == "brush" ]]; then
     # Brush: Rust-based MCMC-style trainer; headless by default (no --with-viewer).
     # Accepts COLMAP or nerfstudio format (auto-detected from scene_dir).
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_aliked" && \
+    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_loma" && "$SFM" != "glomap_aliked" && \
        "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && \
        "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && \
        "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && \
@@ -1834,10 +1866,10 @@ else
     # instantsplat trainer
     # train.py looks for sparse_{N}/0/ — COLMAP/GLOMAP/FastMap write sparse/0/ instead;
     # symlink sparse_N → sparse so the scene loader finds it.
-    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && ln -sfn "sparse" "$SCENE_DIR/sparse_${TOTAL_FRAMES}" 2>/dev/null || true
+    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && ln -sfn "sparse" "$SCENE_DIR/sparse_${TOTAL_FRAMES}" 2>/dev/null || true
     # --pp_optimizer requires confidence_dsp.npy from init_geo.py (MASt3R/Fast3R only)
     PP_OPT_ARG="--pp_optimizer"
-    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && PP_OPT_ARG=""
+    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && PP_OPT_ARG=""
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
         -s "$SCENE_DIR" \
         -m "$MODEL_DIR" \
@@ -2000,7 +2032,7 @@ fi
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 # Remove sparse from assets/examples — canonical copy is now in the pod
-if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_aliked" || \
+if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || \
       "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
       "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
     [[ -d "$SPARSE_PARENT" ]] && rm -rf "$SPARSE_PARENT"
