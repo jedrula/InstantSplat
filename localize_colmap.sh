@@ -32,9 +32,14 @@ MARKER="$POD_DIR/colmap_version.txt"
 [[ -f "$MARKER" ]] || { echo "ERROR: $MARKER missing — pod predates COLMAP version recording (2026-09-07). Re-run its SfM." >&2; exit 1; }
 COLMAP=$(head -1 "$MARKER")
 [[ -x "$COLMAP" ]] || { echo "ERROR: this pod was built with '$COLMAP', which is not executable here." >&2; exit 1; }
-GPU_FLAG_EXTRACT="--FeatureExtraction.use_gpu 1"
+# CPU and GPU SIFT do not produce interchangeable descriptors, so the query must be extracted
+# the same way the pod was — same class of silent "0 verified pairs" failure as a version
+# mismatch. Markers written before --sfm-sift-gpu existed carry no such line and are GPU-built.
+POD_SIFT_GPU=$(sed -n 's/^sift_gpu=//p' "$MARKER")
+POD_SIFT_GPU="${POD_SIFT_GPU:-1}"
+GPU_FLAG_EXTRACT="--FeatureExtraction.use_gpu $POD_SIFT_GPU"
 GPU_FLAG_MATCH="--FeatureMatching.use_gpu 1"
-echo "  COLMAP: $(tail -1 "$MARKER")"
+echo "  COLMAP: $(sed -n 2p "$MARKER")  (SIFT: $([[ "$POD_SIFT_GPU" == 1 ]] && echo GPU || echo CPU))"
 
 VOCAB_TREE="$REPO/assets/vocab_tree_flickr100K_words32K.bin"
 

@@ -296,6 +296,13 @@ def extract_brush_metrics(pod_dir: str) -> dict:
     """Read PSNR/SSIM from Brush training log (RUST_LOG=brush_cli=info format).
     Brush emits: 'Eval iter N: PSNR X.XXXX, ssim Y.YYYY'
     We take the last eval line (end of training).
+
+    Also records where the run actually peaked. The pipeline passes
+    `--export-every "$ITERS"`, so exactly one PLY is written and it is the LAST one — which on
+    a long run is not the best one. Measured 2026-09-12: two 30000-iteration runs peaked at
+    iters 21000 and 17000 and finished 0.076 and 0.084 dB below their own peaks, while eval
+    PSNR oscillated ~0.1 dB peak-to-peak over the last third. `psnr_peak_delta_db` makes that
+    waste visible instead of silent; a clearly negative value means the schedule overshot.
     """
     import re
     log = os.path.join(pod_dir, "02_train.log")
@@ -310,6 +317,32 @@ def extract_brush_metrics(pod_dir: str) -> dict:
                 result["psnr"] = round(float(m.group(1)), 4)
                 result["ssim"] = round(float(m.group(2)), 4)
     return result
+
+
+def extract_brush_curve(pod_dir: str) -> dict:
+    """Peak-vs-shipped from the Brush eval curve. See extract_brush_metrics for why."""
+    import re
+    path = os.path.join(pod_dir, "02_train.log")
+    if not os.path.exists(path):
+        return {}
+    pts = [(int(m.group(1)), float(m.group(2)), float(m.group(3)))
+           for m in re.finditer(r"Eval iter (\d+): PSNR ([\d.]+), ssim ([\d.]+)",
+                                open(path, errors="replace").read())]
+    if len(pts) < 3:
+        # One or two eval points say nothing about a curve. Omit rather than invent a peak.
+        return {}
+    peak = max(pts, key=lambda r: r[1])
+    final = pts[-1]
+    out = {"psnr_peak": round(peak[1], 4),
+           "psnr_peak_iter": peak[0],
+           "psnr_peak_delta_db": round(final[1] - peak[1], 4)}
+    # How much of the run's own gain had landed by each point, so "it overshot" and
+    # "it stopped early" are distinguishable.
+    span = peak[1] - pts[0][1]
+    if span > 0:
+        for frac, key in ((0.90, "iter_at_90pct_gain"), (0.95, "iter_at_95pct_gain")):
+            out[key] = next(r[0] for r in pts if r[1] >= pts[0][1] + frac * span)
+    return out
 
 
 # ── Reference-free splat/SfM health (no GPU/AI) ───────────────────────────────
@@ -375,6 +408,174 @@ def extract_ply_health(pod_dir: str, sparse_dir=None) -> dict:
     return out
 
 
+# ── GPS consistency (captures with pose priors) ───────────────────────────────
+
+# Minimums below which a number would be a guess rather than a measurement. Under any of
+# them the whole block is omitted: silence beats a plausible-looking wrong metric.
+_GPS_MIN_FRAMES = 20      # too few and the fit is not constrained
+_GPS_MIN_EXTENT_M = 25.0  # GPS spread smaller than its own noise -> scale is unidentifiable
+_GPS_MIN_PAIR_M = 10.0    # pairs closer than this measure GPS noise, not scale
+_GPS_INLIER_M = 5.0       # consumer GPS without RTK; ~2.4 m median on a healthy DJI capture
+
+
+def _database_for(pod_dir: str, sparse_dir: str):
+    """The COLMAP database belonging to THIS sparse model.
+
+    A fork (`--sfm preposed_colmap`) has no database of its own: its `sparse/0` is a symlink
+    to the pod that actually ran SfM, so resolve the link and read that pod's database. The
+    priors are then still the ones matching the very poses being measured, not a number
+    copied from a neighbouring run.
+    """
+    own = os.path.join(pod_dir, "database.db")
+    if os.path.exists(own):
+        return own
+    d = os.path.realpath(sparse_dir)
+    for _ in range(4):
+        d = os.path.dirname(d)
+        if not d or d == "/":
+            break
+        cand = os.path.join(d, "database.db")
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _gps_priors(db_path: str) -> dict:
+    """{image_name: (lat, lon, alt)} from COLMAP's own pose_priors — the same data the
+    mapper saw, so the check cannot disagree with the run for a parsing reason."""
+    import sqlite3, math, struct
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        have = con.execute(
+            "select 1 from sqlite_master where type='table' and name='pose_priors'").fetchone()
+        if not have:
+            return {}
+        names = dict(con.execute("select image_id, name from images"))
+        out = {}
+        for data_id, pos, csys in con.execute(
+                "select corr_data_id, position, coordinate_system from pose_priors"):
+            # 0 == WGS84. Any other CRS is a different unit convention; do not guess at it.
+            if csys != 0 or pos is None or data_id not in names:
+                continue
+            lat, lon, alt = struct.unpack("<3d", pos)
+            if not all(map(math.isfinite, (lat, lon, alt))):
+                continue
+            if abs(lat) < 1e-9 and abs(lon) < 1e-9:   # no fix
+                continue
+            out[names[data_id]] = (lat, lon, alt)
+        return out
+    finally:
+        con.close()
+
+
+def _umeyama(src, dst):
+    """similarity dst ~= s * R @ src + t"""
+    import numpy as np
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    S, D = src - mu_s, dst - mu_d
+    U, d, Vt = np.linalg.svd(D.T @ S / len(src))
+    sgn = np.eye(3)
+    sgn[2, 2] = np.sign(np.linalg.det(U @ Vt))
+    R = U @ sgn @ Vt
+    s = float((d * np.diag(sgn)).sum() / (S ** 2).sum() * len(src))
+    return s, R, mu_d - s * R @ mu_s
+
+
+def extract_gps_consistency(pod_dir: str, sparse_dir=None) -> dict:
+    """Is the reconstruction where the GPS says it is, and is it one scene or several?
+
+    Caught arm D of the Plac Staszica ablation (2026-09-11), which registered 774/785 into a
+    single component and looked like the winner on every metric we logged. 29.7% of its
+    cameras were within 5 m of their own GPS and its mission blocks were welded at scales
+    from 18.7 to 65.2 m/unit. Registered count, track length and PSNR all missed it.
+
+    Two independent measures, deliberately:
+      * `gps_within_5m_pct` / `gps_median_err_m` come from a RANSAC sim3, so one badly placed
+        camera cannot move them (a plain Umeyama collapses on this data).
+      * `gps_scale_m_per_unit` / `gps_scale_spread` are FIT-FREE — ratios of pairwise
+        distances — so they stand even when no single transform describes the scene, which
+        is exactly the case a welded reconstruction produces. Spread is p90/p10 of that
+        ratio: 1.0 means one consistent scale. Healthy arms measured 1.04-1.05, arm D 18.6.
+
+    Omitted entirely when the inputs cannot support an honest number.
+    """
+    import numpy as np, math
+
+    if not sparse_dir:
+        return {}
+    db = _database_for(pod_dir, sparse_dir)
+    if not db:
+        return {}
+    try:
+        pri = _gps_priors(db)
+        if not pri:
+            return {}
+
+        import pycolmap
+        rec = pycolmap.Reconstruction(sparse_dir)
+        cen = {}
+        for im in rec.images.values():
+            M = im.cam_from_world().matrix()
+            cen[im.name] = -M[:3, :3].T @ M[:3, 3]
+
+        shared = sorted(set(cen) & set(pri))
+        if len(shared) < _GPS_MIN_FRAMES:
+            return {}
+
+        lat0 = np.median([pri[k][0] for k in shared])
+        lon0 = np.median([pri[k][1] for k in shared])
+        R_E = 6378137.0
+        dst = np.array([[math.radians(pri[k][1] - lon0) * R_E * math.cos(math.radians(lat0)),
+                         math.radians(pri[k][0] - lat0) * R_E,
+                         pri[k][2]] for k in shared])
+        src = np.array([cen[k] for k in shared])
+        if float(np.linalg.norm(dst.max(0) - dst.min(0))) < _GPS_MIN_EXTENT_M:
+            return {}
+
+        res = {"gps_prior_frames": len(shared)}
+        rng = np.random.default_rng(0)   # fixed: the metric must not move between reruns
+
+        # fit-free pairwise scale
+        i = rng.integers(0, len(shared), 20000)
+        j = rng.integers(0, len(shared), 20000)
+        sel = i != j
+        d_gps = np.linalg.norm(dst[i[sel]] - dst[j[sel]], axis=1)
+        d_rec = np.linalg.norm(src[i[sel]] - src[j[sel]], axis=1)
+        ok = (d_gps > _GPS_MIN_PAIR_M) & (d_rec > 1e-9)
+        if ok.sum() >= 100:
+            ratio = d_gps[ok] / d_rec[ok]
+            p10, p50, p90 = np.percentile(ratio, [10, 50, 90])
+            res["gps_scale_m_per_unit"] = round(float(p50), 3)
+            res["gps_scale_spread"] = round(float(p90 / p10), 3)
+
+        # robust sim3 residuals
+        best = None
+        for _ in range(3000):
+            z = rng.choice(len(shared), 4, replace=False)
+            try:
+                s, R, t = _umeyama(src[z], dst[z])
+            except Exception:
+                continue
+            if not np.isfinite(s) or s <= 0:
+                continue
+            e = np.linalg.norm((s * (R @ src.T).T + t) - dst, axis=1)
+            n_in = int((e < _GPS_INLIER_M).sum())
+            if best is None or n_in > best[0]:
+                best = (n_in, e < _GPS_INLIER_M)
+        if best is not None and best[1].sum() >= 4:
+            s, R, t = _umeyama(src[best[1]], dst[best[1]])
+            err = np.linalg.norm((s * (R @ src.T).T + t) - dst, axis=1)
+            res["gps_within_5m_pct"] = round(float(100 * (err < _GPS_INLIER_M).mean()), 1)
+            res["gps_median_err_m"] = round(float(np.median(err)), 2)
+        return res
+    except Exception as e:
+        # Optional metric, same contract as track length: omit it and say why, never emit a
+        # number we cannot stand behind.
+        print(f"[metrics] GPS consistency unavailable ({type(e).__name__}: {e})",
+              file=sys.stderr)
+        return {}
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -399,6 +600,7 @@ def main():
         if "psnr" not in metrics:
             brush = extract_brush_metrics(pod_dir)
             metrics.update(brush)
+    metrics.update(extract_brush_curve(pod_dir))
 
     # Splat/Gaussian stats
     metrics.update(extract_splat_stats(pod_dir))
@@ -410,6 +612,9 @@ def main():
 
     # Reference-free splat/SfM health (persisted so /history shows beyond-PSNR quality)
     metrics.update(extract_ply_health(pod_dir, sparse_dir))
+
+    # GPS consistency — only present when the capture actually carries pose priors
+    metrics.update(extract_gps_consistency(pod_dir, sparse_dir))
 
     print(json.dumps(metrics))
 

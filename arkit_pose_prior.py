@@ -35,7 +35,7 @@ basis flip separates 2.10 deg from 21.94 deg) and independently by triangulation
 (867 correct vs 54 without the flip, 60 read as w2c). Only POSITIONS are needed for a prior,
 and those are the translation column directly — no flip required here.
 """
-import argparse, glob, os, re, sqlite3, struct, subprocess, sys
+import argparse, glob, math, os, re, sqlite3, struct, subprocess, sys
 import numpy as np
 import cv2
 
@@ -52,6 +52,58 @@ def load_traj(path):
             continue
         pos.append([float(x) for x in t[4:7]])
     return np.array(pos, dtype=np.float64), bad
+
+
+def load_forward(path):
+    """-> (N,3) unit viewing directions, same order as load_traj.
+
+    The rotation columns were being thrown away, and with them the only thing that says two
+    cameras cannot possibly see the same wall. Convention verified empirically rather than
+    reasoned about, against 835 sim frames whose true headings are known: forward is
+    R @ (0,0,-1) (ARKit's camera looks down -Z) and the world heading is atan2(fx, -fz),
+    which reproduced every frame to 0.00 deg median AND 0.00 deg p90. Guessing this is how
+    three earlier gravity/pose bugs happened; the check costs one script.
+    """
+    out = []
+    for ln in open(path):
+        t = ln.split()
+        if len(t) != 7:
+            continue
+        R, _ = cv2.Rodrigues(np.array([float(t[1]), float(t[2]), float(t[3])]))
+        f = R @ np.array([0.0, 0.0, -1.0])
+        n = np.linalg.norm(f)
+        out.append(f / n if n else np.array([0.0, 0.0, -1.0]))
+    return np.array(out, dtype=np.float64)
+
+
+def frustum_pairs(pos, fwd, names, max_dist, max_angle):
+    """Pairs that could physically share a view: close enough, and not facing away.
+
+    COLMAP's spatial_matcher pairs on POSITION only -- it was built for GPS, which carries no
+    heading -- so it happily proposes two cameras standing back to back. Measured on
+    block2ha's 9,729 verified baseline pairs, where 344 are strong (>=150 inliers) yet join
+    cameras more than 60 m apart and are therefore impossible:
+
+        angle between viewing directions    false pairs in band
+          0- 60 deg                              0
+         60- 90 deg                            170
+         90-120 deg                            174
+        120-180 deg                              0
+
+    Every false constraint sits in the 60-120 deg band -- two cameras at right angles to each
+    other, both photographing a building CORNER, and in a city where all 42 buildings share
+    one facade texture every corner looks like every other corner. Rejecting above 90 deg
+    removes 51% of them and costs ZERO of the 5,193 good strong pairs.
+    """
+    keep = []
+    for i in range(len(pos)):
+        d = np.linalg.norm(pos - pos[i], axis=1)
+        c = fwd @ fwd[i]
+        ok = (d <= max_dist) & (c >= math.cos(math.radians(max_angle)))
+        for j in np.where(ok)[0]:
+            if j > i:
+                keep.append((names[i], names[int(j)]))
+    return keep
 
 
 def run(colmap, args, log_path):
@@ -104,9 +156,13 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--prior-std", type=float, default=0.01, help="metres, 1-sigma")
     ap.add_argument("--matcher", default="",
-                    help="exhaustive|sequential|vocab_tree|spatial (auto). 'spatial' pairs by "
-                         "prior POSITION rather than appearance — the right choice when a "
-                         "stretch of the capture is texture-poor")
+                    help="exhaustive|sequential|vocab_tree|spatial|frustum (auto). 'spatial' "
+                         "pairs by prior POSITION rather than appearance — the right choice "
+                         "when a stretch of the capture is texture-poor. 'frustum' also uses "
+                         "the recorded ORIENTATION, so two cameras standing close but facing "
+                         "away from each other are never proposed")
+    ap.add_argument("--frustum-max-angle", type=float, default=90.0,
+                    help="degrees between viewing directions; frustum matcher only")
     ap.add_argument("--spatial-max-distance", type=float, default=2.5,
                     help="metres; spatial matcher only. Room-scale default, vs COLMAP's 100")
     ap.add_argument("--spatial-max-neighbors", type=int, default=40,
@@ -207,6 +263,30 @@ def main():
     inject(db, prior, a.prior_std)
 
     print(f"[pose_prior] 3/4 matching ({matcher})")
+    if matcher == "frustum":
+        fwd = load_forward(a.traj)
+        if len(fwd) < len(names):
+            sys.exit(f"[pose_prior] frustum matcher needs a rotation per image; "
+                     f"traj has {len(fwd)} usable rows for {len(names)} images")
+        pos_by_name = np.array([prior[os.path.splitext(n)[0]] for n in names])
+        fwd_by_name = fwd[:len(names)]
+        pairs = frustum_pairs(pos_by_name, fwd_by_name, names,
+                              a.spatial_max_distance, a.frustum_max_angle)
+        if not pairs:
+            sys.exit("[pose_prior] frustum matcher produced no pairs — check the radius")
+        plist = os.path.join(a.out, "frustum_pairs.txt")
+        with open(plist, "w") as fh:
+            for u, v in pairs:
+                fh.write(f"{u} {v}\n")
+        print(f"[pose_prior]   {len(pairs)} pairs within {a.spatial_max_distance} m "
+              f"and {a.frustum_max_angle} deg -> {plist}")
+        run(a.colmap, ["matches_importer", "--database_path", db,
+                       "--match_list_path", plist, "--match_type", "pairs",
+                       "--FeatureMatching.use_gpu", "1"],
+            os.path.join(a.out, "02_match.log"))
+        matcher_done = True
+    else:
+        matcher_done = False
     margs = [f"{matcher}_matcher", "--database_path", db]
     if matcher == "spatial":
         # Pair by WHERE THE CAMERA WAS instead of by what the image looks like. This is the
@@ -236,7 +316,8 @@ def main():
                   "--SequentialMatching.vocab_tree_path", vt]
     if matcher == "vocab_tree":
         margs += ["--VocabTreeMatching.vocab_tree_path", vt]
-    run(a.colmap, margs, os.path.join(a.out, "02_match.log"))
+    if not matcher_done:
+        run(a.colmap, margs, os.path.join(a.out, "02_match.log"))
 
     print("[pose_prior] 4/4 pose_prior_mapper")
     sparse = os.path.join(a.out, "sparse")

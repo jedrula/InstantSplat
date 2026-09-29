@@ -274,6 +274,7 @@ while [[ $# -gt 0 ]]; do
         --growth-stop) GROWTH_STOP="$2"; shift 2 ;;
         --model-dir)    MODEL_DIR_OVERRIDE="$2"; shift 2 ;;
         --preposed-dir) PREPOSED_DIR="$2";      shift 2 ;;
+        --no-sog)       NO_SOG=1;               shift 1 ;;
         --fps-list)     FPS_LIST="$2";     shift 2 ;;
         --nframes-list) NFRAMES_LIST="$2"; shift 2 ;;
         --start-list)   START_LIST="$2";   shift 2 ;;
@@ -413,6 +414,8 @@ if [[ "$SFM" == "pose_prior" ]]; then
         --images "$ARKIT_DIR/images" --traj "$ARKIT_DIR/frames.traj" \
         --pincam "$ARKIT_DIR/intrinsics.pincam" --out "$_PP_OUT" \
         ${COLMAP_MATCHER:+--matcher "$COLMAP_MATCHER"} \
+        ${SPATIAL_MAX_DISTANCE:+--spatial-max-distance "$SPATIAL_MAX_DISTANCE"} \
+        ${SPATIAL_MAX_NEIGHBORS:+--spatial-max-neighbors "$SPATIAL_MAX_NEIGHBORS"} \
         --prior-std "${PRIOR_STD:-0.01}" --colmap "$COLMAP_BIN" || exit 1
     SFM="preposed_colmap"
     PREPOSED_DIR="$_PP_OUT"
@@ -591,6 +594,63 @@ emit_event "{\"event\":\"frames_extracted\",\"total_frames\":$TOTAL_FRAMES}"
 # ── COLMAP feature matching ──────────────────────────────────────────────────
 # One dispatch for every COLMAP-matching SfM path (colmap_sift, glomap_sift,
 # fastmap). $1 is the log basename so each path keeps its own 01b_*.log.
+# Feature extraction, in ONE place. There are four call sites in this script and the
+# camera-group logic was added to exactly one of them, so a two-camera job silently ran
+# single-camera with COLMAP's default focal guess (1920 instead of the 1109 supplied) and
+# dropped the second device's 40 images entirely. One function, four callers.
+#
+# COLMAP registers ONE camera per feature_extractor run. A capture from two devices
+# therefore needs one run per device, each with --image_list_path for that device's images
+# and its own --ImageReader.camera_params. The server writes camera_groups.json beside the
+# images when a job declares groups; without it this behaves exactly as before.
+run_feature_extraction() {
+    local _log="$1"
+    local _FEAT_TYPE_ARG=()
+    [[ -n "${FEATURE_TYPE:-}" ]] && _FEAT_TYPE_ARG=(--FeatureExtraction.type "$FEATURE_TYPE")
+    local _GROUPS_JSON="$SCENE_DIR/camera_groups.json"
+
+    if [[ -f "$_GROUPS_JSON" ]]; then
+        local _NG
+        _NG=$("$PYTHON" -c "import json,sys;print(len(json.load(open(sys.argv[1]))))" "$_GROUPS_JSON")
+        echo "    Camera groups: $_NG (one feature_extractor run each)"
+        local _gi _GLIST _GPARAMS _GMODEL _GLABEL
+        for _gi in $(seq 0 $((_NG - 1))); do
+            _GLIST=$("$PYTHON"  -c "import json,sys;g=json.load(open(sys.argv[1]))[int(sys.argv[2])];print(g['list'])" "$_GROUPS_JSON" "$_gi")
+            _GPARAMS=$("$PYTHON" -c "import json,sys;g=json.load(open(sys.argv[1]))[int(sys.argv[2])];print(g.get('camera_params',''))" "$_GROUPS_JSON" "$_gi")
+            _GMODEL=$("$PYTHON" -c "import json,sys;g=json.load(open(sys.argv[1]))[int(sys.argv[2])];print(g.get('camera_model','PINHOLE'))" "$_GROUPS_JSON" "$_gi")
+            _GLABEL=$("$PYTHON" -c "import json,sys;g=json.load(open(sys.argv[1]))[int(sys.argv[2])];print(g.get('label',''))" "$_GROUPS_JSON" "$_gi")
+            local _GP_ARG=()
+            [[ -n "$_GPARAMS" ]] && _GP_ARG=(--ImageReader.camera_params "$_GPARAMS")
+            echo "      group $_gi ($_GLABEL): $_GMODEL ${_GPARAMS:-estimated}"
+            "$COLMAP_BIN" feature_extractor \
+                --database_path "$DB_PATH" \
+                --image_path "$IMAGE_DIR" \
+                --image_list_path "$SCENE_DIR/$_GLIST" \
+                --ImageReader.camera_model "$_GMODEL" \
+                --ImageReader.single_camera 1 \
+                "${_GP_ARG[@]}" \
+                "${_FEAT_TYPE_ARG[@]}" \
+                --FeatureExtraction.use_gpu "$SFM_SIFT_GPU" \
+                "${_SIFT_THREAD_ARG[@]}" \
+                --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
+                2>&1 | tee -a "$MODEL_DIR/$_log"
+        done
+    else
+        "$COLMAP_BIN" feature_extractor \
+            --database_path "$DB_PATH" \
+            --image_path "$IMAGE_DIR" \
+            --ImageReader.camera_model "$CAMERA_MODEL" \
+            --ImageReader.single_camera 1 \
+            "${_CAM_PARAMS_ARG[@]}" \
+            "${_FEAT_TYPE_ARG[@]}" \
+            --FeatureExtraction.use_gpu "$SFM_SIFT_GPU" \
+            "${_SIFT_THREAD_ARG[@]}" \
+            --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
+            2>&1 | tee "$MODEL_DIR/$_log"
+    fi
+}
+
+
 run_matcher() {
     local _log="$MODEL_DIR/$1"
     # Resolve matcher: explicit flag > auto (exhaustive <=150 frames, else vocab_tree).
@@ -654,9 +714,43 @@ run_matcher() {
             --FeatureMatching.use_gpu 1 \
             2>&1 | tee "$_log"
         ;;
+    sequential_loop)
+        # Sequential matching PLUS loop closure. Bare sequential only ever links frames that
+        # are adjacent in filename order, so a capture that comes back past itself -- three
+        # concentric laps, an orbit returning to a circuit -- gets no constraint tying the
+        # laps together, and GLOMAP compresses along the unconstrained axis. Measured on the
+        # lanes arm: a 16.8 m room solved as 9.2 m wide, 11.8% of cameras in one block.
+        #
+        # Loop detection queries the vocabulary tree every `period` frames for the most
+        # similar images ANYWHERE in the capture and matches those too, which is the link
+        # that ties lap to lap. Cost is still far below exhaustive: O(n*k) plus the queries.
+        #
+        # Separate from `sequential` on purpose -- bare sequential stays exactly as it was,
+        # so the warning about it remains true.
+        # Set here, not inherited: the only other assignment is `local` inside the
+        # vocab_tree branch, which never runs on this path.
+        local VOCAB_TREE="$REPO/assets/vocab_tree_faiss_flickr100K_words256K.bin"
+        if [[ ! -f "$VOCAB_TREE" ]]; then
+            echo "Error: sequential_loop needs the vocabulary tree at $VOCAB_TREE"
+            exit 1
+        fi
+        _MATCH_TYPE_ARG=()
+        [[ -n "${MATCHING_TYPE:-}" ]] && _MATCH_TYPE_ARG=(--FeatureMatching.type "$MATCHING_TYPE")
+        "$COLMAP_BIN" sequential_matcher \
+            --database_path "$DB_PATH" \
+            "${_MATCH_TYPE_ARG[@]}" \
+            --SequentialMatching.overlap 10 \
+            --SequentialMatching.quadratic_overlap 1 \
+            --SequentialMatching.loop_detection 1 \
+            --SequentialMatching.loop_detection_period 5 \
+            --SequentialMatching.loop_detection_num_images 50 \
+            --SequentialMatching.vocab_tree_path "$VOCAB_TREE" \
+            --FeatureMatching.use_gpu 1 \
+            2>&1 | tee "$_log"
+        ;;
     *)
         echo "Error: unknown --colmap-matcher '$_MATCHER'"
-        echo "       expected one of: exhaustive | vocab_tree | spatial | sequential"
+        echo "       expected one of: exhaustive | vocab_tree | spatial | sequential | sequential_loop"
         exit 1
         ;;
     esac
@@ -705,16 +799,11 @@ elif [[ "$SFM" == "colmap_sift" ]]; then
     echo "    Camera model: $CAMERA_MODEL"
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
     echo "    Feature extractor: $([[ "$SFM_SIFT_GPU" == 1 ]] && echo GPU || echo CPU) SIFT"
-    "$COLMAP_BIN" feature_extractor \
-        --database_path "$DB_PATH" \
-        --image_path "$IMAGE_DIR" \
-        --ImageReader.camera_model "$CAMERA_MODEL" \
-        --ImageReader.single_camera 1 \
-        "${_CAM_PARAMS_ARG[@]}" \
-        --FeatureExtraction.use_gpu "$SFM_SIFT_GPU" \
-        "${_SIFT_THREAD_ARG[@]}" \
-        --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
-        2>&1 | tee "$MODEL_DIR/01a_colmap_features.log"
+    # COLMAP 4.2.0 does learned features itself, through ONNX, with no hloc and no PyTorch:
+    # SIFT (default), ALIKED, and LoMa. $FEATURE_TYPE selects it; empty keeps SIFT, so every
+    # existing capture runs byte-identically. Our ALIKED arm previously died with
+    # torch.OutOfMemoryError inside hloc's LightGlue, which this path avoids entirely.
+    run_feature_extraction 01a_colmap_features.log
 
     run_matcher 01b_colmap_match.log
 
@@ -804,16 +893,7 @@ elif [[ "$SFM" == "glomap_sift" ]]; then
     echo "    Camera model: $CAMERA_MODEL"
     echo "    Feature max_image_size: $SFM_MAX_IMAGE_SIZE"
     echo "    Feature extractor: $([[ "$SFM_SIFT_GPU" == 1 ]] && echo GPU || echo CPU) SIFT"
-    "$COLMAP_BIN" feature_extractor \
-        --database_path "$DB_PATH" \
-        --image_path "$IMAGE_DIR" \
-        --ImageReader.camera_model "$CAMERA_MODEL" \
-        --ImageReader.single_camera 1 \
-        "${_CAM_PARAMS_ARG[@]}" \
-        --FeatureExtraction.use_gpu "$SFM_SIFT_GPU" \
-        "${_SIFT_THREAD_ARG[@]}" \
-        --FeatureExtraction.max_image_size "$SFM_MAX_IMAGE_SIZE" \
-        2>&1 | tee "$MODEL_DIR/01a_glomap_features.log"
+    run_feature_extraction 01a_glomap_features.log
 
     run_matcher 01b_glomap_match.log
 
@@ -1853,7 +1933,13 @@ emit_event "{\"event\":\"splat_ready\",\"filename\":\"$(basename $SPLAT_OUT)\",\
 # it does not hide a training problem.
 SOG_OUT="${PLY%.ply}.sog"
 SPLAT_TRANSFORM_BIN="${SPLAT_TRANSFORM_BIN:-/home/communications/.nvm/versions/node/v22.22.2/bin/splat-transform}"
-if [[ -x "$SPLAT_TRANSFORM_BIN" ]]; then
+if [[ "$NO_SOG" == "1" ]]; then
+    # Measured 131 s of a 7.3 min job on 1.23M splats -- 30% of the run for a
+    # WEB DELIVERY artefact an experiment never opens. Skipped explicitly rather
+    # than by pointing SPLAT_TRANSFORM_BIN at nothing, which would print
+    # "not found" and read like a broken install.
+    echo "[3b/3] skipping .sog (--no-sog): experiment run, /sog converts on demand"
+elif [[ -x "$SPLAT_TRANSFORM_BIN" ]]; then
     echo "[3b/3] Converting to .sog for web delivery..."
     SOG_START=$(date +%s)
     if "$SPLAT_TRANSFORM_BIN" "$PLY" "$SOG_OUT" >/dev/null 2>&1; then
