@@ -684,6 +684,7 @@ run_matcher() {
         elif (( TOTAL_FRAMES <= 150 )); then _MATCHER="exhaustive"; else _MATCHER="vocab_tree"; fi
     fi
     echo "    Matcher: $_MATCHER"
+    MATCHER_USED="$_MATCHER"       # recorded in sfm_done: the job's params only hold what was REQUESTED (often "" = auto)
     # Descriptor matcher, for every pair selector below. Learned features need their own
     # matcher (LOMA_B features + LOMA_B matcher); COLMAP's default is SIFT_BRUTEFORCE.
     local _MATCH_TYPE_ARG=()
@@ -1550,7 +1551,7 @@ SFM_ELAPSED=$(( SFM_END - SFM_START ))
 SFM_MIN=$(awk "BEGIN {printf \"%.1f\", $SFM_ELAPSED / 60}")
 echo "    → SfM step: ${SFM_ELAPSED}s (${SFM_MIN} min)"
 
-emit_event "{\"event\":\"sfm_done\",\"sfm\":\"$SFM\",\"elapsed_s\":$SFM_ELAPSED}"
+emit_event "{\"event\":\"sfm_done\",\"sfm\":\"$SFM\",\"matcher\":\"${MATCHER_USED:-}\",\"elapsed_s\":$SFM_ELAPSED}"
 
 if [[ "$SFM" == "mast3r" ]] && (( SFM_ELAPSED > 120 )); then
     echo "    ⚠  Slow MASt3R (>${SFM_ELAPSED}s) — compiling the RoPE2D CUDA kernel would save ~20-40% here. See InstantSplat/TODO.md."
