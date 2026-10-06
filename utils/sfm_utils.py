@@ -23,8 +23,7 @@ from dust3r.utils.image import _resize_pil_image
 from dust3r.utils.device import to_numpy
 from scene.colmap_loader import (
     qvec2rotmat, read_extrinsics_binary, rotmat2qvec,
-    write_cameras_binary, write_cameras_text,
-    write_images_text, write_images_binary
+    write_cameras_binary, write_images_binary
 )
 
 try:
@@ -201,7 +200,6 @@ CAMERA_MODEL_NAMES = dict([(camera_model.model_name, camera_model)
       
 def save_extrinsic(sparse_path, extrinsics_w2c, img_files, image_suffix):
     images_bin_file = sparse_path / 'images.bin'
-    images_txt_file = sparse_path / 'images.txt'
     images = {}
     
     for i, (w2c, img_file) in enumerate(zip(extrinsics_w2c, img_files), start=1):  # Start enumeration from 1
@@ -221,7 +219,6 @@ def save_extrinsic(sparse_path, extrinsics_w2c, img_files, image_suffix):
         )
     
     write_images_binary(images, images_bin_file)
-    write_images_text(images, images_txt_file)
 
 
 def save_intrinsics(sparse_path, focals, org_imgs_shape, imgs_shape, save_focals=False):
@@ -229,7 +226,6 @@ def save_intrinsics(sparse_path, focals, org_imgs_shape, imgs_shape, save_focals
     scale_factor_x = org_width / imgs_shape[2]
     scale_factor_y = org_height / imgs_shape[1]
     cameras_bin_file = sparse_path / 'cameras.bin'
-    cameras_txt_file = sparse_path / 'cameras.txt'
 
     cameras = {}
     for i, focal in enumerate(focals, start=1):  # Start enumeration from 1
@@ -242,7 +238,6 @@ def save_intrinsics(sparse_path, focals, org_imgs_shape, imgs_shape, save_focals
         )    
     print(f' - scaling focal: ({focal}, {focal}) --> ({focal*scale_factor_x}, {focal*scale_factor_y})' )
     write_cameras_binary(cameras, cameras_bin_file)
-    write_cameras_text(cameras, cameras_txt_file)
     if save_focals:
         np.save(sparse_path / 'non_scaled_focals.npy', focals)
 
@@ -250,7 +245,6 @@ def save_intrinsics(sparse_path, focals, org_imgs_shape, imgs_shape, save_focals
 def save_points3D(sparse_path, imgs, pts3d, confs, masks=None, use_masks=True, save_all_pts=False, save_txt_path=None, depth_threshold=0.1, max_pts_num=150 * 10**10):
     
     points3D_bin_file = sparse_path / 'points3D.bin'
-    points3D_txt_file = sparse_path / 'points3D.txt'
     points3D_ply_file = sparse_path / 'points3D.ply'
 
     # Convert inputs to numpy arrays

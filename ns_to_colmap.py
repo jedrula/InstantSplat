@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Convert a nerfstudio transforms.json to COLMAP text sparse/0/ format,
-then write binary for fast loading by gsplat / brush / pgsr.
+Convert a nerfstudio transforms.json to a binary COLMAP sparse/0/ model
+for gsplat / brush.
 
 Usage:
     python ns_to_colmap.py <transforms_json> <output_sparse_dir> [--ply <ply_path>]
 
-Output: <output_sparse_dir>/cameras.{txt,bin}, images.{txt,bin}, points3D.{txt,bin}
+Output: <output_sparse_dir>/{cameras,images,points3D,rigs,frames}.bin
 
 Coordinate convention:
   RealityScan (and some other exporters) write transforms.json in OpenCV/COLMAP convention
@@ -14,40 +14,11 @@ Coordinate convention:
   COLMAP w2c = inv(c2w): R_w2c = R_c2w.T, t_w2c = -R_w2c @ t_c2w.
   No axis-flip is needed for RealityScan exports.
 """
-import argparse, json, struct
+import argparse, json
 from pathlib import Path
 
 import numpy as np
-
-
-def _rot_to_quat_wxyz(R: np.ndarray) -> tuple:
-    """Rotation matrix → (qw, qx, qy, qz) following COLMAP convention."""
-    trace = R[0, 0] + R[1, 1] + R[2, 2]
-    if trace > 0:
-        s = 0.5 / np.sqrt(trace + 1.0)
-        w = 0.25 / s
-        x = (R[2, 1] - R[1, 2]) * s
-        y = (R[0, 2] - R[2, 0]) * s
-        z = (R[1, 0] - R[0, 1]) * s
-    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
-        w = (R[2, 1] - R[1, 2]) / s
-        x = 0.25 * s
-        y = (R[0, 1] + R[1, 0]) / s
-        z = (R[0, 2] + R[2, 0]) / s
-    elif R[1, 1] > R[2, 2]:
-        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
-        w = (R[0, 2] - R[2, 0]) / s
-        x = (R[0, 1] + R[1, 0]) / s
-        y = 0.25 * s
-        z = (R[1, 2] + R[2, 1]) / s
-    else:
-        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
-        w = (R[1, 0] - R[0, 1]) / s
-        x = (R[0, 2] + R[2, 0]) / s
-        y = (R[1, 2] + R[2, 1]) / s
-        z = 0.25 * s
-    return (w, x, y, z)
+import pycolmap
 
 
 def _read_ply_xyz_rgb(path: str):
@@ -94,42 +65,25 @@ def ns_to_colmap(transforms_json: str, output_dir: str, ply_path: str | None = N
     cx  = float(d["cx"])
     cy  = float(d["cy"])
 
-    # ── cameras.txt ──────────────────────────────────────────────────────────
-    cameras_txt = out / "cameras.txt"
-    with open(cameras_txt, "w") as f:
-        f.write("# Camera list with one line of data per camera:\n")
-        f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-        f.write(f"1 PINHOLE {w} {h} {fl_x} {fl_y} {cx} {cy}\n")
+    rec = pycolmap.Reconstruction()
+    rec.add_camera_with_trivial_rig(pycolmap.Camera(
+        model="PINHOLE", width=w, height=h, params=[fl_x, fl_y, cx, cy], camera_id=1))
 
-    # ── images.txt ───────────────────────────────────────────────────────────
     # RealityScan exports use OpenCV/COLMAP convention (Z-forward, no Y-flip).
     # COLMAP w2c = inv(c2w): R_w2c = R_c2w.T, t_w2c = -R_w2c @ t_c2w
-    images_txt = out / "images.txt"
-    with open(images_txt, "w") as f:
-        f.write("# Image list with two lines of data per image:\n")
-        f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-        f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
-        for idx, frame in enumerate(d["frames"]):
-            c2w = np.array(frame["transform_matrix"], dtype=np.float64)
-            R_c2w = c2w[:3, :3]
-            t_c2w = c2w[:3, 3]
-            R_w2c = R_c2w.T
-            t_w2c = -R_w2c @ t_c2w
-            qw, qx, qy, qz = _rot_to_quat_wxyz(R_w2c)
-            fname = Path(frame["file_path"]).name
-            image_id = idx + 1
-            f.write(f"{image_id} {qw:.9f} {qx:.9f} {qy:.9f} {qz:.9f} "
-                    f"{t_w2c[0]:.9f} {t_w2c[1]:.9f} {t_w2c[2]:.9f} 1 {fname}\n")
-            f.write("\n")  # empty POINTS2D line
+    for idx, frame in enumerate(d["frames"]):
+        c2w = np.array(frame["transform_matrix"], dtype=np.float64)
+        R_w2c = c2w[:3, :3].T
+        t_w2c = -R_w2c @ c2w[:3, 3]
+        image = pycolmap.Image(name=Path(frame["file_path"]).name, camera_id=1, image_id=idx + 1)
+        rec.add_image_with_trivial_frame(image, pycolmap.Rigid3d(np.hstack([R_w2c, t_w2c[:, None]])))
 
-    # ── points3D.txt ─────────────────────────────────────────────────────────
     ply_file = ply_path
     if ply_file is None:
         rel = d.get("ply_file_path")
         if rel:
             ply_file = str(ns_dir / rel)
 
-    points3d_txt = out / "points3D.txt"
     if ply_file and Path(ply_file).exists():
         print(f"  Loading point cloud from {ply_file}...")
         xyz, rgb = _read_ply_xyz_rgb(ply_file)
@@ -140,26 +94,14 @@ def ns_to_colmap(transforms_json: str, output_dir: str, ply_path: str | None = N
             print(f"  Subsampled to {len(xyz):,} / {len(xyz):,} points (max_points={max_points})")
         else:
             print(f"  {len(xyz):,} points")
-        with open(points3d_txt, "w") as f:
-            f.write("# 3D point list with one line of data per point:\n")
-            f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
-            for pid, (p, c) in enumerate(zip(xyz, rgb)):
-                f.write(f"{pid+1} {p[0]:.6f} {p[1]:.6f} {p[2]:.6f} "
-                        f"{c[0]} {c[1]} {c[2]} 0.0\n")
+        for p, c in zip(xyz, rgb):
+            rec.add_point3D(p, pycolmap.Track(), c)
     else:
         print("  No PLY found — writing empty points3D")
-        with open(points3d_txt, "w") as f:
-            f.write("# 3D point list\n# Number of points: 0\n")
 
-    # ── text → binary ─────────────────────────────────────────────────────────
-    print("  Converting text → binary...")
-    import pycolmap
-    rec = pycolmap.Reconstruction()
-    rec.read_text(str(out))
     rec.write_binary(str(out))
     print(f"  Done: {rec.num_cameras()} cam, {rec.num_images()} images, "
           f"{rec.num_points3D():,} points → {out}")
-
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

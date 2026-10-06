@@ -97,7 +97,7 @@ def centres_by_frame(rec):
 def load_components(sparse_dir):
     comps = []
     for d in sorted(Path(sparse_dir).iterdir()):
-        if not (d / "images.bin").exists() and not (d / "images.txt").exists():
+        if not (d / "images.bin").exists():
             continue
         if not d.name.isdigit():
             continue
@@ -275,8 +275,7 @@ def main():
         merged = merge(comps, base_idx)
 
     os.makedirs(a.out, exist_ok=True)
-    merged.write(a.out)
-    merged.write_text(a.out)
+    merged.write_binary(a.out)
     print(f"[merge] -> {a.out}")
     print(f"[merge] {merged.num_images()} images, {merged.num_points3D():,} points, "
           f"mean track {merged.compute_mean_track_length():.2f}, "

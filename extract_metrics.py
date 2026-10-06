@@ -191,45 +191,20 @@ def extract_gsplat_metrics(pod_dir: str) -> dict:
 
 def extract_sfm_metrics(sparse_dir: str) -> dict:
     """
-    Extract registration stats from a COLMAP sparse model directory.
-    Works with both text (.txt) and binary (.bin) formats.
+    Extract registration stats from a binary COLMAP sparse model directory.
     """
     if not sparse_dir or not os.path.isdir(sparse_dir):
         return {}
 
     result = {}
 
-    # Registered image count from images.txt
-    images_txt = os.path.join(sparse_dir, "images.txt")
-    images_bin = os.path.join(sparse_dir, "images.bin")
-    if os.path.exists(images_txt):
-        count = 0
-        with open(images_txt) as f:
-            for line in f:
-                if line.strip() and not line.startswith("#"):
-                    count += 1
-        result["registered_images"] = count // 2  # two lines per image
-    elif os.path.exists(images_bin):
-        try:
-            with open(images_bin, "rb") as f:
-                n = struct.unpack("<Q", f.read(8))[0]
-            result["registered_images"] = n
-        except Exception:
-            pass
-
-    # Point count from points3D.txt or .bin
-    pts_txt = os.path.join(sparse_dir, "points3D.txt")
-    pts_bin = os.path.join(sparse_dir, "points3D.bin")
-    if os.path.exists(pts_txt):
-        count = sum(1 for l in open(pts_txt) if l.strip() and not l.startswith("#"))
-        result["sfm_points"] = count
-    elif os.path.exists(pts_bin):
-        try:
-            with open(pts_bin, "rb") as f:
-                n = struct.unpack("<Q", f.read(8))[0]
-            result["sfm_points"] = n
-        except Exception:
-            pass
+    # Counts straight from the .bin headers (a uint64 count leads each file), so a MASt3R/Fast3R
+    # sparse dir -- cameras.bin + images.bin, points only as a PLY -- still reports its images.
+    for key, name in (("registered_images", "images.bin"), ("sfm_points", "points3D.bin")):
+        path = os.path.join(sparse_dir, name)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                result[key] = struct.unpack("<Q", f.read(8))[0]
 
     # Mean track length — how many views actually see the average point. This is the variable
     # that predicts whether the capture is view-graph starved, and `registered_images` hides

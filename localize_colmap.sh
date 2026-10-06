@@ -14,6 +14,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${INSTANTSPLAT_PYTHON:-${HOME}/miniconda3/envs/instantsplat/bin/python}"   # needs pycolmap
 
 POD_DIR="${1:?Usage: $0 <pod_dir> <query_image> [output.json] [--vocab-tree]}"
 QUERY_IMG="${2:?Usage: $0 <pod_dir> <query_image> [output.json] [--vocab-tree]}"
@@ -50,7 +51,7 @@ DATABASE="$POD_DIR/database.db"
 [[ -f "$DATABASE" ]]           || { echo "ERROR: $DATABASE not found. Re-run the job to generate it."; exit 1; }
 [[ -f "$QUERY_IMG" ]]          || { echo "ERROR: query image not found: $QUERY_IMG"; exit 1; }
 [[ -d "$SPARSE_IN" ]]          || { echo "ERROR: sparse/0 not found in $POD_DIR"; exit 1; }
-[[ -f "$SPARSE_IN/images.txt" || -f "$SPARSE_IN/images.bin" ]] || { echo "ERROR: no images.txt/bin in $SPARSE_IN"; exit 1; }
+[[ -f "$SPARSE_IN/images.bin" ]] || { echo "ERROR: no images.bin in $SPARSE_IN"; exit 1; }
 if [[ "$USE_VOCAB_TREE" == "--vocab-tree" ]]; then
     [[ -f "$VOCAB_TREE" ]] || { echo "ERROR: vocab tree not found: $VOCAB_TREE"; exit 1; }
 fi
@@ -65,24 +66,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 DB_RAW="$TMPDIR/database_raw.db"
 DB="$TMPDIR/database.db"
 cp "$DATABASE" "$DB_RAW"
-python3 "$REPO/remap_db_to_sparse.py" "$DB_RAW" "$SPARSE_IN/images.txt" "$DB"
-
-# Build a consistent text sparse model for image_registrator.
-# GLOMAP's text export has inconsistencies between images.txt and points3D.txt
-# (the pipeline's expand_glomap_images.py rewrites images.txt in DB order but
-# points3D.txt still uses GLOMAP's original observation indices). COLMAP 4.x
-# added a strict consistency check that catches this and aborts.
-# Fix: convert from the binary model (always consistent) to text.
-SPARSE_WORK="$TMPDIR/sparse_in/0"
-mkdir -p "$SPARSE_WORK"
-if [[ -f "$SPARSE_IN/images.bin" && -f "$SPARSE_IN/points3D.bin" ]]; then
-    "$COLMAP" model_converter \
-        --input_path "$SPARSE_IN" \
-        --output_path "$SPARSE_WORK" \
-        --output_type TXT 2>&1 | tail -3
-else
-    cp "$SPARSE_IN"/*.txt "$SPARSE_WORK/" 2>/dev/null || true
-fi
+"$PYTHON" "$REPO/remap_db_to_sparse.py" "$DB_RAW" "$SPARSE_IN" "$DB"
 
 # Query image goes in its own directory so feature_extractor only touches it
 QUERY_DIR="$TMPDIR/query"
@@ -135,7 +119,7 @@ echo ""
 echo "--- Step 3: Image registration ---"
 "$COLMAP" image_registrator \
     --database_path "$DB" \
-    --input_path "$SPARSE_WORK" \
+    --input_path "$SPARSE_IN" \
     --output_path "$SPARSE_OUT" \
     --Mapper.ba_refine_focal_length 1 \
     --Mapper.min_focal_length_ratio 0.1 \
@@ -146,19 +130,7 @@ echo "--- Step 3: Image registration ---"
 echo ""
 echo "--- Step 4: Extracting pose ---"
 
-# image_registrator writes binary .bin files by default; convert to .txt for parsing
-REGISTERED_BIN=$(find "$SPARSE_OUT" -name "images.bin" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
-if [[ -n "$REGISTERED_BIN" && ! -f "$REGISTERED_BIN/images.txt" ]]; then
-    SPARSE_TXT="$TMPDIR/sparse_txt"
-    mkdir -p "$SPARSE_TXT"
-    "$COLMAP" model_converter \
-        --input_path "$REGISTERED_BIN" \
-        --output_path "$SPARSE_TXT" \
-        --output_type TXT 2>&1 | tail -3
-    REGISTERED_SPARSE="$SPARSE_TXT"
-else
-    REGISTERED_SPARSE=$(find "$SPARSE_OUT" -name "images.txt" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
-fi
+REGISTERED_SPARSE=$(find "$SPARSE_OUT" -name "images.bin" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
 
 if [[ -z "$REGISTERED_SPARSE" ]]; then
     echo "ERROR: image_registrator produced no output — query image could not be registered."
@@ -166,56 +138,28 @@ if [[ -z "$REGISTERED_SPARSE" ]]; then
     exit 1
 fi
 
-python3 - <<PYEOF
+"$PYTHON" - <<PYEOF
 import json, math, sys
 from pathlib import Path
+import pycolmap
 
-sparse_dir   = Path("$REGISTERED_SPARSE")
+rec          = pycolmap.Reconstruction("$REGISTERED_SPARSE")
 query_name   = "$QUERY_NAME"
 output_json  = Path("$OUTPUT_JSON")
 
-# ── Parse cameras.txt ─────────────────────────────────────────────────────────
-cams = {}
-cam_file = sparse_dir / "cameras.txt"
-if cam_file.exists():
-    for line in cam_file.read_text().splitlines():
-        if line.startswith("#") or not line.strip(): continue
-        p = line.split()
-        cams[int(p[0])] = {"w": int(p[2]), "h": int(p[3])}
-
-# ── Parse images.txt — find query row ────────────────────────────────────────
-images_file = sparse_dir / "images.txt"
-if not images_file.exists():
-    sys.exit("ERROR: no images.txt in registered sparse model")
-
-lines = [l for l in images_file.read_text().splitlines()
-         if not l.startswith("#") and l.strip()]
-
-query_row = None
-query_obs_line = None
-for i in range(0, len(lines), 2):
-    if Path(lines[i].split()[-1]).name == query_name:
-        query_row = lines[i].split()
-        query_obs_line = lines[i + 1] if i + 1 < len(lines) else ""
-        break
-
-if query_row is None:
-    all_names = [Path(lines[i].split()[-1]).name for i in range(0, len(lines), 2)]
+query = next((im for im in rec.images.values() if Path(im.name).name == query_name), None)
+if query is None or not query.has_pose:
     print(f"WARNING: '{query_name}' not found in registered model.", file=sys.stderr)
-    print(f"  Registered images: {all_names}", file=sys.stderr)
+    print(f"  Registered images: {[Path(im.name).name for im in rec.images.values()]}", file=sys.stderr)
     sys.exit(1)
 
-# Count 2D-3D inlier correspondences (point3D_id != -1 in observation line)
-inliers = 0
-if query_obs_line:
-    obs_tokens = query_obs_line.split()
-    # format: X1 Y1 POINT3D_ID1 X2 Y2 POINT3D_ID2 ...
-    for k in range(2, len(obs_tokens), 3):
-        if obs_tokens[k] != "-1":
-            inliers += 1
+# 2D-3D inlier correspondences = the query's observations that carry a 3D point
+obs_ids = [p2d.point3D_id for p2d in query.points2D if p2d.has_point3D()]
+inliers = len(obs_ids)
+visible_ids = set(obs_ids)
 
-qw, qx, qy, qz = map(float, query_row[1:5])
-tx, ty, tz      = map(float, query_row[5:8])
+qx, qy, qz, qw = query.cam_from_world().rotation.quat   # pycolmap stores xyzw
+tx, ty, tz     = query.cam_from_world().translation
 
 # Normalise quaternion
 n = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
@@ -244,13 +188,7 @@ up = [x/n_up for x in up]
 
 # look_at: use pts3D centroid directly (same approach as camera_from_colmap.py).
 # No projection onto fwd — works regardless of camera orientation.
-pts_file = sparse_dir / "points3D.txt"
-pts3d_by_id = {}
-if pts_file.exists():
-    for line in pts_file.read_text().splitlines():
-        if line.startswith("#") or not line.strip(): continue
-        p = line.split()
-        pts3d_by_id[int(p[0])] = [float(p[1]), float(p[2]), float(p[3])]
+pts3d_by_id = {pid: list(p.xyz) for pid, p in rec.points3D.items()}
 
 pts3d = list(pts3d_by_id.values())
 if not pts3d:
@@ -258,13 +196,6 @@ if not pts3d:
 
 # Use centroid of 3D points visible from the query image so look_at points
 # at the section of the wall actually in the frame, not the whole scene center.
-visible_ids = set()
-if query_obs_line:
-    obs_tokens = query_obs_line.split()
-    for k in range(2, len(obs_tokens), 3):
-        if obs_tokens[k] != "-1":
-            visible_ids.add(int(obs_tokens[k]))
-
 visible_pts = [pts3d_by_id[pid] for pid in visible_ids if pid in pts3d_by_id]
 target_pts = visible_pts if visible_pts else pts3d
 

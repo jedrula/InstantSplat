@@ -87,7 +87,7 @@ SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
 SFM="mast3r"       # mast3r | fast3r | pose_prior | colmap_sift | glomap_sift | glomap_loma | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | glomap_dedode | colmap_aliked | fastmap | realityscan | onthefly
-TRAINER="instantsplat"  # instantsplat | pgsr | splatfacto | gsplat | onthefly | brush
+TRAINER="instantsplat"  # instantsplat | splatfacto | gsplat | 2dgs | brush | onthefly
 LANGSPLAT=0         # 1 = run LangSplat pipeline after training
 LANGSPLAT_ITERS=3000
 LANGSPLAT_AE_EPOCHS=30
@@ -237,7 +237,6 @@ while [[ $# -gt 0 ]]; do
         --viewer-port)      VIEWER_PORT="$2";    shift 2 ;;
         --engine)           # deprecated: map to --sfm + --trainer
             case "$2" in
-                pgsr)    SFM="mast3r";  TRAINER="pgsr" ;;
                 fast3r)  SFM="fast3r";  TRAINER="instantsplat" ;;
                 colmap)  SFM="colmap_sift";  TRAINER="instantsplat" ;;
                 glomap)  SFM="glomap_sift";  TRAINER="instantsplat" ;;
@@ -293,6 +292,13 @@ while [[ $# -gt 0 ]]; do
         *)              VIDEOS+=("$1"); shift ;;
     esac
 done
+
+# The training if/elif chain ends in a bare `else` = instantsplat, so an unknown trainer
+# would silently train instantsplat. Reject it here instead.
+case "$TRAINER" in
+    instantsplat|splatfacto|gsplat|2dgs|brush|onthefly) ;;
+    *) echo "Error: unknown --trainer '$TRAINER' (instantsplat|splatfacto|gsplat|2dgs|brush|onthefly)"; exit 1 ;;
+esac
 
 # SfM feature-extraction cap: must be a positive integer, since it is spliced
 # straight into the COLMAP command line at three call sites.
@@ -881,7 +887,7 @@ PYCOMP
         fi
     fi
 
-    # Outlier filter (needs binary reconstruction; works before text conversion)
+    # Outlier filter
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_colmap_filter.log"
 
@@ -906,12 +912,6 @@ PYCOMP
         rm -rf "$UNDIST_DIR"
     fi
 
-    # Convert binary → text (cameras.txt, images.txt, points3D.txt) for train.py
-    "$COLMAP_BIN" model_converter \
-        --input_path "$SPARSE_PARENT/0" \
-        --output_path "$SPARSE_PARENT/0" \
-        --output_type TXT \
-        2>&1 | tee "$MODEL_DIR/01e_colmap_convert.log"
 elif [[ "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" ]]; then
     echo "[2/3] COLMAP features + matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
     DB_PATH="$SCENE_DIR/database.db"
@@ -1001,19 +1001,12 @@ PYCOMP
         rm -rf "$UNDIST_DIR"
     fi
 
-    "$COLMAP_BIN" model_converter \
-        --input_path "$SPARSE_PARENT/0" \
-        --output_path "$SPARSE_PARENT/0" \
-        --output_type TXT \
-        2>&1 | tee "$MODEL_DIR/01e_glomap_convert.log"
 
     # Persist remapped database for query-image localization.
     # GLOMAP reassigns image IDs vs the feature_extractor DB; remap so
     # localize_colmap.sh can match DB images to the sparse model by ID.
-    if [[ -f "$DB_PATH" && -f "$SPARSE_PARENT/0/images.txt" ]]; then
-        python3 "$REPO/remap_db_to_sparse.py" \
-            "$DB_PATH" "$SPARSE_PARENT/0/images.txt" "$MODEL_DIR/database.db"
-    fi
+    "$PYTHON" "$REPO/remap_db_to_sparse.py" \
+        "$DB_PATH" "$SPARSE_PARENT/0" "$MODEL_DIR/database.db"
 
 elif [[ "$SFM" == "glomap_aliked" ]]; then
     echo "[2/3] ALIKED+LightGlue features + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
@@ -1049,11 +1042,6 @@ elif [[ "$SFM" == "glomap_aliked" ]]; then
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_aliked_filter.log"
 
-    "$COLMAP_BIN" model_converter \
-        --input_path "$SPARSE_PARENT/0" \
-        --output_path "$SPARSE_PARENT/0" \
-        --output_type TXT \
-        2>&1 | tee "$MODEL_DIR/01c_glomap_aliked_convert.log"
 elif [[ "$SFM" == "glomap_loftr" ]]; then
     echo "[2/3] LoFTR semi-dense matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
     SPARSE_PARENT="$SCENE_DIR/sparse"
@@ -1092,11 +1080,6 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_loftr_filter.log"
 
-    "$COLMAP_BIN" model_converter \
-        --input_path "$SPARSE_PARENT/0" \
-        --output_path "$SPARSE_PARENT/0" \
-        --output_type TXT \
-        2>&1 | tee "$MODEL_DIR/01c_glomap_loftr_convert.log"
 elif [[ "$SFM" == "glomap_dedode" ]]; then
     echo "[2/3] DeDoDe detect+describe + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
     SPARSE_PARENT="$SCENE_DIR/sparse"
@@ -1130,11 +1113,6 @@ elif [[ "$SFM" == "glomap_dedode" ]]; then
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_dedode_filter.log"
 
-    "$COLMAP_BIN" model_converter \
-        --input_path "$SPARSE_PARENT/0" \
-        --output_path "$SPARSE_PARENT/0" \
-        --output_type TXT \
-        2>&1 | tee "$MODEL_DIR/01c_glomap_dedode_convert.log"
 elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" ]]; then
     case "$SFM" in
         glomap_disk) _MATCHER="disk+lightglue";       _MAPPER="glomap" ;;
@@ -1184,11 +1162,6 @@ elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "c
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_${SFM}_filter.log"
 
-    "$COLMAP_BIN" model_converter \
-        --input_path "$SPARSE_PARENT/0" \
-        --output_path "$SPARSE_PARENT/0" \
-        --output_type TXT \
-        2>&1 | tee "$MODEL_DIR/01c_${SFM}_convert.log"
 elif [[ "$SFM" == "fastmap" ]]; then
     echo "[2/3] COLMAP features + matching + FastMap pose estimation ($TOTAL_FRAMES frames)..."
     DB_PATH="$SCENE_DIR/database.db"
@@ -1233,11 +1206,6 @@ elif [[ "$SFM" == "fastmap" ]]; then
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_fastmap_filter.log"
 
-    "$COLMAP_BIN" model_converter \
-        --input_path "$SPARSE_PARENT/0" \
-        --output_path "$SPARSE_PARENT/0" \
-        --output_type TXT \
-        2>&1 | tee "$MODEL_DIR/01e_fastmap_convert.log"
 elif [[ "$SFM" == "realityscan" ]]; then
     echo "[2/3] RealityScan alignment + COLMAP export ($TOTAL_FRAMES frames)..."
     # RealityScan always needs an X display even with -stdConsole; xvfb-run -a
@@ -1332,6 +1300,8 @@ PYEOF
 
     # rs_colmap_params.xml  → COLMAP writer (images.txt + points3D.txt, undistorted images)
     # rs_csv_params.xml     → CSV intrinsics export (needed to synthesise cameras.txt)
+    # RS's text model is INPUT only: it is completed in place under $RS_OUT and converted
+    # once to binary into sparse/0 — the pipeline's own model is binary-only.
     RS_PARAMS="Z:${REPO}/rs_colmap_params.xml"
     RS_CSV_PARAMS="Z:${REPO}/rs_csv_params.xml"
 
@@ -1366,21 +1336,16 @@ PYEOF
         exit 1
     fi
 
-    # Move images.txt + points3D.txt (cameras.txt is synthesised below).
-    for _f in images.txt points3D.txt; do
-        [[ -f "$RS_COLMAP_DIR/$_f" ]] && mv "$RS_COLMAP_DIR/$_f" "$SPARSE_PARENT/0/"
-    done
-
-    # Synthesise cameras.txt from CSV intrinsics + images.txt.
+    # Synthesise the cameras.txt RS omits, from CSV intrinsics + images.txt.
     RS_UNDIST_DIR="$RS_OUT/images"
     "$PYTHON" "$REPO/rs_make_cameras_txt.py" \
-        "$SPARSE_PARENT/0/images.txt" \
+        "$RS_COLMAP_DIR/images.txt" \
         "$RS_OUT/intrinsics.csv" \
         "$RS_UNDIST_DIR" \
-        "$SPARSE_PARENT/0/cameras.txt" \
+        "$RS_COLMAP_DIR/cameras.txt" \
         2>&1 | tee -a "$MODEL_DIR/01a_rs_align.log"
 
-    if [[ ! -f "$SPARSE_PARENT/0/cameras.txt" ]]; then
+    if [[ ! -f "$RS_COLMAP_DIR/cameras.txt" ]]; then
         echo "Error: rs_make_cameras_txt.py failed. Check $MODEL_DIR/01a_rs_align.log"
         exit 1
     fi
@@ -1388,7 +1353,7 @@ PYEOF
     # RS undistorted images are RGBA and vary in size per image (different undistortion crops).
     # Normalise them to the canonical W×H in cameras.txt (RGB, consistent size) so trainers
     # don't crash on dimension mismatches.
-    python3 - "$SPARSE_PARENT/0/cameras.txt" "$RS_UNDIST_DIR" <<'PYEOF'
+    python3 - "$RS_COLMAP_DIR/cameras.txt" "$RS_UNDIST_DIR" <<'PYEOF'
 import sys, os
 from PIL import Image
 
@@ -1416,13 +1381,20 @@ for fname in os.listdir(img_dir):
 print(f"  done")
 PYEOF
 
-    # Convert text reconstruction to binary so gsplat/pgsr/nerfstudio fast loaders work.
+    # Registration-only export (no points3D.txt): give pycolmap an empty point list to read,
+    # then seed points3D.bin from the sparse PLY below.
+    RS_HAS_POINTS=1
+    if [[ ! -f "$RS_COLMAP_DIR/points3D.txt" ]]; then
+        RS_HAS_POINTS=0
+        printf "# 3D point list\n# Number of points: 0\n" > "$RS_COLMAP_DIR/points3D.txt"
+    fi
+
+    # RS text model → binary sparse/0 (the only form the pipeline keeps).
     "$PYTHON" -c "
 import pycolmap
-from pathlib import Path
-p = Path('$SPARSE_PARENT/0')
-r = pycolmap.Reconstruction(str(p))
-r.write_binary(str(p))
+r = pycolmap.Reconstruction()
+r.read_text('$RS_COLMAP_DIR')
+r.write_binary('$SPARSE_PARENT/0')
 print(f'  → text→binary: {len(r.cameras)} cameras, {len(r.images)} images, {len(r.points3D)} points')
 " 2>&1 | tee -a "$MODEL_DIR/01a_rs_align.log"
 
@@ -1430,16 +1402,13 @@ print(f'  → text→binary: {len(r.cameras)} cameras, {len(r.images)} images, {
     IMAGE_DIR="$RS_UNDIST_DIR"
     TOTAL_FRAMES=$(find "$IMAGE_DIR" -maxdepth 1 \( -name "*.png" -o -name "*.jpg" \) | wc -l)
 
-    # If points3D is missing (registration-only export), synthesise it from the PLY
-    if [[ ! -f "$SPARSE_PARENT/0/points3D.bin" && ! -f "$SPARSE_PARENT/0/points3D.txt" ]]; then
+    if [[ "$RS_HAS_POINTS" == "0" ]]; then
         if [[ -f "$RS_OUT/points3D.ply" ]]; then
             "$PYTHON" "$REPO/rs_ply_to_points3d.py" \
                 "$RS_OUT/points3D.ply" \
                 "$SPARSE_PARENT/0/points3D.bin" \
                 2>&1 | tee -a "$MODEL_DIR/01a_rs_align.log"
         else
-            # No points at all — write an empty points3D.txt so pycolmap can load
-            printf "# 3D point list\n# Number of points: 0\n" > "$SPARSE_PARENT/0/points3D.txt"
             echo "    ⚠  No sparse points found — initialising with empty points3D"
         fi
     fi
@@ -1454,11 +1423,6 @@ print(f'  → text→binary: {len(r.cameras)} cameras, {len(r.images)} images, {
         while read -r _img; do ln -sfn "$_img" "$SCENE_DIR/images/$(basename "$_img")"; done
     IMAGE_DIR="$SCENE_DIR/images"
 
-    "$COLMAP_BIN" model_converter \
-        --input_path "$SPARSE_PARENT/0" \
-        --output_path "$SPARSE_PARENT/0" \
-        --output_type TXT \
-        2>&1 | tee "$MODEL_DIR/01c_rs_convert.log"
 elif [[ "$SFM" == "preposed" ]]; then
     echo "[2/3] SfM skipped — converting nerfstudio poses → COLMAP sparse from $PREPOSED_DIR"
     SPARSE_PARENT="$MODEL_DIR/sparse"
@@ -1626,7 +1590,7 @@ elif [[ "$TRAINER" == "splatfacto" ]]; then
             2>&1 | tee "$MODEL_DIR/02_train.log"
         # Extract initial camera from training views for the splat viewer
         [[ -f "$NS_PROCESS_DIR/transforms.json" ]] && \
-            python3 "$REPO/camera_from_colmap.py" \
+            "$PYTHON" "$REPO/camera_from_colmap.py" \
                 --sparse   "$SPARSE_PARENT/0" \
                 --trainer  splatfacto \
                 --ns-process-dir "$NS_PROCESS_DIR" \
@@ -1635,33 +1599,6 @@ elif [[ "$TRAINER" == "splatfacto" ]]; then
                 --out      "$MODEL_DIR/initial_camera.json" \
                 2>/dev/null || true
     fi
-elif [[ "$TRAINER" == "pgsr" ]]; then
-    # For mast3r/fast3r, symlink sparse → sparse_N so sparse/0/ exists.
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_loma" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
-    # PGSR looks for sparse/images.bin (no 0/ subdir) — symlink files up from sparse/0/
-    for _f in cameras.txt images.txt points3D.txt cameras.bin images.bin points3D.bin; do
-        [[ -f "$SCENE_DIR/sparse/0/$_f" ]] && \
-            ln -sfn "0/$_f" "$SCENE_DIR/sparse/$_f" 2>/dev/null || true
-    done
-    PGSR_DIR="${PGSR_DIR:-/home/communications/workdir/pgsr}"
-    PGSR_PYTHON="${PGSR_PYTHON:-$PYTHON}"
-    echo "[2/3] PGSR training ($ITERS iterations, $TOTAL_FRAMES frames)..."
-    cd "$PGSR_DIR"
-    CUDA_VISIBLE_DEVICES=0 "$PGSR_PYTHON" ./train.py \
-        -s "$SCENE_DIR" \
-        -m "$MODEL_DIR" \
-        --iterations "$ITERS" \
-        --save_iterations "$ITERS" \
-        --test_iterations "$ITERS" \
-        2>&1 | tee "$MODEL_DIR/02_train.log"
-    # Extract initial camera (no colmap_to_ply_transform.npy for pgsr yet — COLMAP world space)
-    python3 "$REPO/camera_from_colmap.py" \
-        --sparse     "$SPARSE_PARENT/0" \
-        --trainer    pgsr \
-        --result-dir "$MODEL_DIR" \
-        --splat      "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
-        --out        "$MODEL_DIR/initial_camera.json" \
-        2>/dev/null || true
 elif [[ "$TRAINER" == "gsplat" ]]; then
     # gsplat via InstantSplat/simple_trainer.py — already proven on this 8GB machine
     # preposed: force MCMC (default strategy FPEs during densification with dense PLY init)
@@ -1733,7 +1670,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
             2>&1 | tee "$MODEL_DIR/02_train.log"
     fi
     # Extract initial camera (uses colmap_to_ply_transform.npy saved by simple_trainer.py)
-    python3 "$REPO/camera_from_colmap.py" \
+    "$PYTHON" "$REPO/camera_from_colmap.py" \
         --sparse     "$SPARSE_PARENT/0" \
         --trainer    gsplat \
         --result-dir "$GSPLAT_OUT" \
@@ -1762,7 +1699,7 @@ elif [[ "$TRAINER" == "2dgs" ]]; then
         --prune-opa 0.05 \
         --refine-stop-iter "$_GS_REFINE_STOP" \
         2>&1 | tee "$MODEL_DIR/02_train.log"
-    python3 "$REPO/camera_from_colmap.py" \
+    "$PYTHON" "$REPO/camera_from_colmap.py" \
         --sparse     "$SPARSE_PARENT/0" \
         --trainer    gsplat \
         --result-dir "$GSPLAT_OUT" \
@@ -1777,7 +1714,7 @@ elif [[ "$TRAINER" == "brush" ]]; then
        "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && \
        "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && \
         ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
-    BRUSH_BIN="${BRUSH_BIN:-/home/communications/workdir/brush-main/bin/brush-521}"
+    BRUSH_BIN="${BRUSH_BIN:-/home/communications/workdir/brush-main/bin/brush-554}"
     BRUSH_OUT="$MODEL_DIR/brush_output"
     mkdir -p "$BRUSH_OUT"
     # For preposed: pass MODEL_DIR (has sparse/ but NOT transforms.json) so brush
@@ -1856,7 +1793,7 @@ elif [[ "$TRAINER" == "brush" ]]; then
         exit 1
     fi
     SPARSE_PARENT="$SCENE_DIR/sparse"
-    python3 "$REPO/camera_from_colmap.py" \
+    "$PYTHON" "$REPO/camera_from_colmap.py" \
         --sparse     "$SPARSE_PARENT/0" \
         --trainer    brush \
         --result-dir "$BRUSH_OUT" \
@@ -1884,7 +1821,7 @@ else
         2>&1 | tee "$MODEL_DIR/02_train.log"
     # instantsplat trainer: no colmap_to_ply_transform.npy yet; use sparse/0 directly
     # (output will be in COLMAP world space — still better than nothing)
-    python3 "$REPO/camera_from_colmap.py" \
+    "$PYTHON" "$REPO/camera_from_colmap.py" \
         --sparse     "$SPARSE_PARENT/0" \
         --trainer    instantsplat \
         --result-dir "$MODEL_DIR" \

@@ -14,8 +14,8 @@ import sys
 import torch
 from PIL import Image
 from typing import NamedTuple
-from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
-    read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
+from scene.colmap_loader import qvec2rotmat, \
+    read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
@@ -315,14 +315,14 @@ def storePly(path, xyz, rgb):
 def readColmapSceneInfo(path, images, eval, args, llffhold=8):
 
     if eval:
-        cameras_extrinsic_file = os.path.join(path, f"sparse_{args.n_views}/1", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, f"sparse_{args.n_views}/1", "cameras.txt")
+        cameras_extrinsic_file = os.path.join(path, f"sparse_{args.n_views}/1", "images.bin")
+        cameras_intrinsic_file = os.path.join(path, f"sparse_{args.n_views}/1", "cameras.bin")
     else:
-        cameras_extrinsic_file = os.path.join(path, f"sparse_{args.n_views}/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, f"sparse_{args.n_views}/0", "cameras.txt")
+        cameras_extrinsic_file = os.path.join(path, f"sparse_{args.n_views}/0", "images.bin")
+        cameras_intrinsic_file = os.path.join(path, f"sparse_{args.n_views}/0", "cameras.bin")
 
-    cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
-    cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+    cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+    cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     reading_dir = "images" if images == None else images
 
     cam_infos_unsorted, poses = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
@@ -346,13 +346,9 @@ def readColmapSceneInfo(path, images, eval, args, llffhold=8):
 
     ply_path = os.path.join(path, f"sparse_{args.n_views}/0/points3D.ply")
     bin_path = os.path.join(path, f"sparse_{args.n_views}/0/points3D.bin")
-    txt_path = os.path.join(path, f"sparse_{args.n_views}/0/points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
+        xyz, rgb, _ = read_points3D_binary(bin_path)
         storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)

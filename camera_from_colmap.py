@@ -11,8 +11,6 @@ the COLMAP → PLY transform per trainer from files they already write to disk:
 
   gsplat     : <result_dir>/colmap_to_ply_transform.npy  (saved by simple_trainer.py)
   splatfacto : <ns_process_dir>/transforms.json  +  <ns_train_dir>/**/dataparser_transforms.json
-  pgsr       : <result_dir>/colmap_to_ply_transform.npy  (same approach as gsplat;
-               you need to add the save call to pgsr/train.py if you want it)
 
 If no transform file is found the output is in raw COLMAP world space — still
 useful for inspecting relative orientation.
@@ -21,7 +19,7 @@ Usage
 -----
   python camera_from_colmap.py \\
       --sparse   <path/to/sparse/0>     \\
-      --trainer  gsplat|splatfacto|pgsr \\
+      --trainer  gsplat|splatfacto|instantsplat|brush \\
       --result-dir <trainer output dir> \\
       --out      <path/to/initial_camera.json>
 
@@ -215,37 +213,20 @@ def _scene_centroid_from_splat(splat_path: Path | None) -> np.ndarray | None:
 
 # ── FOV + distance helpers ────────────────────────────────────────────────────
 
-def _read_fov_y_from_cameras_txt(sparse_dir: Path) -> float | None:
-    """Return vertical FOV in radians from sparse/0/cameras.txt, or None."""
-    p = sparse_dir / "cameras.txt"
+def _read_fov_y_from_cameras_bin(sparse_dir: Path) -> float | None:
+    """Return vertical FOV in radians from the first camera in sparse/0/cameras.bin, or None."""
+    p = sparse_dir / "cameras.bin"
     if not p.exists():
         return None
-    try:
-        with open(p) as f:
-            for line in f:
-                if line.startswith("#") or not line.strip():
-                    continue
-                parts = line.split()
-                if len(parts) < 5:
-                    continue
-                model = parts[1].upper()
-                try:
-                    w, h = int(parts[2]), int(parts[3])
-                except ValueError:
-                    continue
-                if not (0 < w < 20000 and 0 < h < 20000):
-                    continue
-                params = list(map(float, parts[4:]))
-                # PINHOLE/OPENCV: params = [fx, fy, cx, cy, ...] → use fy
-                if model in ("PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV") and len(params) > 1:
-                    fl_y = params[1]
-                else:
-                    fl_y = params[0]
-                if fl_y > 0:
-                    return 2 * math.atan(h / (2 * fl_y))
-    except Exception:
-        pass
-    return None
+    with open(p, "rb") as f:
+        if struct.unpack("<Q", f.read(8))[0] == 0:
+            return None
+        _cam_id, model_id, _w, h = struct.unpack("<iiQQ", f.read(24))
+        p0, p1 = struct.unpack("<2d", f.read(16))
+    # PINHOLE / OPENCV / OPENCV_FISHEYE / FULL_OPENCV: params = [fx, fy, cx, cy, ...] → fy;
+    # the SIMPLE_* / RADIAL family has a single f first.
+    fl_y = p1 if model_id in (1, 4, 5, 6) else p0
+    return 2 * math.atan(h / (2 * fl_y)) if fl_y > 0 else None
 
 
 def _pullback_position(pos: np.ndarray, look_at: np.ndarray,
@@ -485,7 +466,7 @@ def run(sparse_dir: Path, transform: np.ndarray | None,
         look_at = cam_centroid + fwd_level * look_dist
 
     # Ensure the initial camera is far enough back to see MIN_WALL_HEIGHT_M vertically.
-    fov_y = _read_fov_y_from_cameras_txt(sparse_dir)
+    fov_y = _read_fov_y_from_cameras_bin(sparse_dir)
     if fov_y and fov_y > 0:
         min_dist_m = (MIN_WALL_HEIGHT_M / 2) / math.tan(fov_y / 2)
     else:
@@ -522,9 +503,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sparse",         required=True, help="Path to sparse/0 directory")
     ap.add_argument("--trainer",        default="gsplat",
-                    choices=["gsplat", "splatfacto", "pgsr", "instantsplat", "brush"],
+                    choices=["gsplat", "splatfacto", "instantsplat", "brush"],
                     help="Which trainer produced the PLY")
-    ap.add_argument("--result-dir",     help="Trainer output dir (gsplat/pgsr: contains colmap_to_ply_transform.npy)")
+    ap.add_argument("--result-dir",     help="Trainer output dir (gsplat/instantsplat: contains colmap_to_ply_transform.npy)")
     ap.add_argument("--ns-process-dir", help="Nerfstudio process dir (splatfacto: contains transforms.json)")
     ap.add_argument("--ns-train-dir",   help="Nerfstudio train dir (splatfacto: parent of dataparser_transforms.json)")
     ap.add_argument("--frame",          help="Pin a specific image by filename (basename match)")
@@ -567,9 +548,9 @@ def main():
         return
 
     # All other trainers: read images.bin from sparse/0
-    if args.trainer in ("gsplat", "pgsr", "instantsplat"):
+    if args.trainer in ("gsplat", "instantsplat"):
         if not args.result_dir:
-            print("Error: --result-dir required for gsplat/pgsr", file=sys.stderr)
+            print("Error: --result-dir required for gsplat/instantsplat", file=sys.stderr)
             sys.exit(1)
         transform = _load_transform_gsplat(Path(args.result_dir))
         if transform is not None:

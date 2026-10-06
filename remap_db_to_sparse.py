@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 remap_db_to_sparse.py — Rewrite a COLMAP database so image IDs match a
-GLOMAP-output sparse model (images.txt).
+GLOMAP-output sparse model.
 
 GLOMAP's global_mapper reassigns image IDs in its output, so the sparse/0/
-images.txt IDs won't match the original feature-extraction database IDs.
+image IDs won't match the original feature-extraction database IDs.
 colmap image_registrator crashes on this mismatch.
 
 Usage:
-    python remap_db_to_sparse.py <database.db> <sparse/0/images.txt> <output.db>
+    python remap_db_to_sparse.py <database.db> <sparse/0> <output.db>
 
 Schema handling:
   GLOMAP-built DBs have an extended schema: `type NOT NULL` in `descriptors`
@@ -20,6 +20,8 @@ import shutil
 import sqlite3
 import sys
 from pathlib import Path
+
+import pycolmap
 
 
 def pair_id(id1: int, id2: int) -> int:
@@ -36,19 +38,15 @@ def decode_pair_id(pid: int):
 
 def main():
     if len(sys.argv) != 4:
-        sys.exit(f"Usage: {sys.argv[0]} <database.db> <images.txt> <output.db>")
+        sys.exit(f"Usage: {sys.argv[0]} <database.db> <sparse/0> <output.db>")
 
     db_path    = Path(sys.argv[1])
-    images_txt = Path(sys.argv[2])
+    sparse_dir = Path(sys.argv[2])
     out_path   = Path(sys.argv[3])
 
     # ── Read sparse model: name → sparse_id ──────────────────────────────────
-    sparse_name_to_id = {}
-    with open(images_txt) as f:
-        lines = [l for l in f if not l.startswith("#") and l.strip()]
-    for i in range(0, len(lines), 2):
-        parts = lines[i].split()
-        sparse_name_to_id[parts[9]] = int(parts[0])
+    rec = pycolmap.Reconstruction(str(sparse_dir))
+    sparse_name_to_id = {img.name: img_id for img_id, img in rec.images.items()}
     print(f"Sparse model: {len(sparse_name_to_id)} images")
 
     # ── Read database image IDs ───────────────────────────────────────────────
