@@ -35,7 +35,7 @@ basis flip separates 2.10 deg from 21.94 deg) and independently by triangulation
 (867 correct vs 54 without the flip, 60 read as w2c). Only POSITIONS are needed for a prior,
 and those are the translation column directly — no flip required here.
 """
-import argparse, glob, math, os, re, sqlite3, struct, subprocess, sys
+import argparse, glob, math, os, re, shutil, sqlite3, struct, subprocess, sys
 import numpy as np
 import cv2
 
@@ -183,6 +183,13 @@ def main():
     ap.add_argument("--colmap", default=os.environ.get("COLMAP_BIN", "colmap"),
                     help="MUST be COLMAP >= 4.0: 3.9.1 has no pose_prior_mapper, and the "
                          "two generations' SIFT descriptors are incompatible")
+    ap.add_argument("--camera-model", choices=("OPENCV", "PINHOLE"),
+                    default=os.environ.get("POSE_PRIOR_CAMERA_MODEL", "OPENCV"),
+                    help="OPENCV (default): the ARKit intrinsics plus k1,k2,p1,p2 starting at 0, "
+                         "refined by the mapper, then the model and images are undistorted to "
+                         "PINHOLE so downstream sees the same layout as before. ARKit's intrinsics "
+                         "carry no distortion, but the frames have it — Spirula's own SfM fitted "
+                         "k1=0.055 k2=-0.066 on ab29e999. PINHOLE is the old behaviour")
     a = ap.parse_args()
 
     names = sorted(n for n in os.listdir(a.images)
@@ -248,10 +255,11 @@ def main():
         ext += ["--FeatureExtraction.use_gpu", "0"]
         print("[pose_prior] oversized frames — extracting features on CPU")
     print("[pose_prior] 1/4 features")
+    cam_params = f"{fx},{fy},{cx},{cy}" + (",0,0,0,0" if a.camera_model == "OPENCV" else "")
     run(a.colmap, ["feature_extractor", "--database_path", db, "--image_path", a.images,
-                   "--ImageReader.camera_model", "PINHOLE",
+                   "--ImageReader.camera_model", a.camera_model,
                    "--ImageReader.single_camera", "1",
-                   "--ImageReader.camera_params", f"{fx},{fy},{cx},{cy}"] + ext,
+                   "--ImageReader.camera_params", cam_params] + ext,
         os.path.join(a.out, "01_features.log"))
 
     matcher = a.matcher or ("exhaustive" if len(names) <= 300 else "vocab_tree")
@@ -370,9 +378,52 @@ def main():
                 os.rename(final, os.path.join(a.out, "sparse", "_was0"))
             os.rename(tmp, final)
     link = os.path.join(a.out, "images")
+    if a.camera_model != "PINHOLE":
+        # Downstream (preposed_colmap, every trainer) expects a PINHOLE sparse/0 next to images/.
+        # Undistort here so that contract holds: the fitted model is kept as sparse/0_distorted.
+        und = os.path.join(a.out, "undistorted")
+        shutil.rmtree(und, ignore_errors=True)
+        run(a.colmap, ["image_undistorter", "--image_path", a.images, "--input_path", final,
+                       "--output_path", und, "--output_type", "COLMAP"],
+            os.path.join(a.out, "04_undistort.log"))
+        if not os.path.exists(os.path.join(und, "sparse", "cameras.bin")):
+            sys.exit(f"[pose_prior] image_undistorter failed — see {os.path.join(a.out, '04_undistort.log')}")
+        k = fitted_distortion(final)
+        if k:
+            print(f"[pose_prior] fitted distortion k1={k[0]:.4f} k2={k[1]:.4f} p1={k[2]:.5f} p2={k[3]:.5f}; "
+                  f"undistorted to PINHOLE")
+        dist = os.path.join(a.out, "sparse", "0_distorted")
+        shutil.rmtree(dist, ignore_errors=True)
+        os.rename(final, dist)
+        os.makedirs(final)
+        for f in os.listdir(os.path.join(und, "sparse")):
+            os.rename(os.path.join(und, "sparse", f), os.path.join(final, f))
+        if os.path.islink(link):
+            os.remove(link)
+        elif os.path.exists(link):
+            shutil.rmtree(link)
+        os.rename(os.path.join(und, "images"), link)
     if not os.path.exists(link):
         os.symlink(os.path.abspath(a.images), link)
     print(f"[pose_prior] -> {a.out}")
+
+
+def fitted_distortion(model_dir):
+    """k1,k2,p1,p2 of the first OPENCV camera in a binary model, or None."""
+    try:
+        with open(os.path.join(model_dir, "cameras.bin"), "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            for _ in range(n):
+                _cid, model_id, _w, _h = struct.unpack("<iiQQ", f.read(24))
+                nparams = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8}.get(model_id)
+                if nparams is None:
+                    return None
+                p = struct.unpack(f"<{nparams}d", f.read(8 * nparams))
+                if model_id == 4:          # OPENCV: fx fy cx cy k1 k2 p1 p2
+                    return p[4:8]
+    except OSError:
+        return None
+    return None
 
 
 if __name__ == "__main__":
