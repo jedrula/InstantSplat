@@ -646,11 +646,15 @@ emit_event "{\"event\":\"frames_extracted\",\"total_frames\":$TOTAL_FRAMES}"
 # does not match (fork-training 44668193 trained on exactly that mismatch, -1.5 dB).
 undistort_to_pinhole() {
     echo "    Undistorting images ($1 → PINHOLE)..."
-    # Keep the DISTORTED model in the pod: it is the one that pairs with the pod's images/ (the upload),
-    # so a fork can retrain from it -- the undistorted images themselves are scratch and get deleted.
-    rm -rf "$MODEL_DIR/sparse_distorted"
-    mkdir -p "$MODEL_DIR/sparse_distorted"
-    cp -rL "$SPARSE_PARENT/0" "$MODEL_DIR/sparse_distorted/0"
+    # $2 = keep: save the DISTORTED model in the pod, because it is the one that pairs with the pod's
+    # images/ (the upload) and a fork retrains from it. Only the SfM paths pass it: a preposed pod's
+    # images/ links to the UNDISTORTED set, so there sparse/0 already pairs with images/ and a saved
+    # distorted model would claim a pairing that is false (7bb4f58c scored 16.6 dB through exactly that).
+    if [[ "${2:-}" == "keep" ]]; then
+        rm -rf "$MODEL_DIR/sparse_distorted"
+        mkdir -p "$MODEL_DIR/sparse_distorted"
+        cp -rL "$SPARSE_PARENT/0" "$MODEL_DIR/sparse_distorted/0"
+    fi
     local UNDIST_DIR="$SCENE_DIR/undistorted"
     rm -rf "$UNDIST_DIR"
     "$COLMAP_BIN" image_undistorter \
@@ -930,7 +934,7 @@ PYCOMP
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_colmap_filter.log"
 
-    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then undistort_to_pinhole "$CAMERA_MODEL"; fi
+    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then undistort_to_pinhole "$CAMERA_MODEL" keep; fi
 
 elif [[ "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" ]]; then
     echo "[2/3] COLMAP features + matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
@@ -1000,7 +1004,7 @@ PYCOMP
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_glomap_filter.log"
 
-    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then undistort_to_pinhole "$CAMERA_MODEL"; fi
+    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then undistort_to_pinhole "$CAMERA_MODEL" keep; fi
 
 
     # Persist remapped database for query-image localization.
@@ -1438,7 +1442,7 @@ elif [[ "$SFM" == "spirula" ]]; then
     mv "$_SP_WS/sparse/0" "$SPARSE_PARENT/0"
     rm -rf "$_SP_IN" "$_SP_WS"
     _SP_MODEL=$("$PYTHON" -c "import pycolmap,sys;print({c.model.name for c in pycolmap.Reconstruction(sys.argv[1]).cameras.values()}.pop())" "$SPARSE_PARENT/0")
-    if [[ "$_SP_MODEL" != "PINHOLE" ]]; then undistort_to_pinhole "$_SP_MODEL"; fi
+    if [[ "$_SP_MODEL" != "PINHOLE" ]]; then undistort_to_pinhole "$_SP_MODEL" keep; fi
 
 elif [[ "$SFM" == "preposed" ]]; then
     echo "[2/3] SfM skipped — converting nerfstudio poses → COLMAP sparse from $PREPOSED_DIR"
