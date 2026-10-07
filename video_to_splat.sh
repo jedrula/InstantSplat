@@ -1437,7 +1437,17 @@ elif [[ "$SFM" == "spirula" ]]; then
     rm -rf "$SPARSE_PARENT" "$_SP_IN" "$_SP_WS"
     mkdir -p "$_SP_IN" "$SPARSE_PARENT"
     ln -sfn "$IMAGE_DIR" "$_SP_IN/images"      # it scans the whole folder: hand it ONLY the images
-    "$SPIRULA_BIN" sfm auto "$_SP_IN" -o "$_SP_WS" 2>&1 | tee "$MODEL_DIR/01_spirula_sfm.log"
+    # --colmap-matcher says whether the capture is ORDERED; Spirula's equivalent is --sequence, which makes its
+    # mapper trust each photo's neighbours in the walk first -- "keeps repeated structure from folding the model
+    # onto itself" (block2ha's 42 identical facades fold every retrieval-paired 40x40). No silent mapping otherwise.
+    case "$COLMAP_MATCHER" in
+        "")              _SP_SEQ=() ;;
+        sequential_loop) _SP_SEQ=(--sequence .) ;;
+        sequential)      _SP_SEQ=(--sequence . --pairs sequential --no-loop-closure) ;;
+        *) echo "Error: --sfm spirula has no equivalent of --colmap-matcher $COLMAP_MATCHER (use '', sequential, sequential_loop)"; exit 1 ;;
+    esac
+    echo "    Spirula SfM flags: ${_SP_SEQ[*]:-(auto pairs)}"
+    "$SPIRULA_BIN" sfm auto "$_SP_IN" -o "$_SP_WS" "${_SP_SEQ[@]}" 2>&1 | tee "$MODEL_DIR/01_spirula_sfm.log"
     [[ -f "$_SP_WS/sparse/0/cameras.bin" ]] || { echo "Error: spirula sfm produced no sparse/0. Check $MODEL_DIR/01_spirula_sfm.log"; exit 1; }
     mv "$_SP_WS/sparse/0" "$SPARSE_PARENT/0"
     rm -rf "$_SP_IN" "$_SP_WS"
