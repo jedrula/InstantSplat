@@ -86,8 +86,8 @@ SMART_FRAMES=0
 SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
-SFM="mast3r"       # mast3r | fast3r | pose_prior | colmap_sift | glomap_sift | glomap_loma | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | glomap_dedode | colmap_aliked | fastmap | realityscan | onthefly
-TRAINER="instantsplat"  # instantsplat | splatfacto | gsplat | 2dgs | brush | onthefly
+SFM="mast3r"       # mast3r | fast3r | pose_prior | spirula | colmap_sift | glomap_sift | glomap_loma | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | glomap_dedode | colmap_aliked | fastmap | realityscan | onthefly
+TRAINER="instantsplat"  # instantsplat | splatfacto | gsplat | 2dgs | brush | spirula | onthefly
 LANGSPLAT=0         # 1 = run LangSplat pipeline after training
 LANGSPLAT_ITERS=3000
 LANGSPLAT_AE_EPOCHS=30
@@ -293,12 +293,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# The SfM methods that leave a COLMAP model in sparse/0. One list: it used to be spelled out in eight
+# separate if-chains, and adding a method meant finding all of them.
+COLMAP_SFMS=" colmap_sift glomap_sift glomap_loma glomap_aliked glomap_loftr glomap_dedode glomap_disk glomap_superpoint colmap_aliked fastmap realityscan spirula "
+is_colmap_sfm() { [[ "$COLMAP_SFMS" == *" $SFM "* ]]; }
+
 # The training if/elif chain ends in a bare `else` = instantsplat, so an unknown trainer
 # would silently train instantsplat. Reject it here instead.
 case "$TRAINER" in
-    instantsplat|splatfacto|gsplat|2dgs|brush|onthefly) ;;
-    *) echo "Error: unknown --trainer '$TRAINER' (instantsplat|splatfacto|gsplat|2dgs|brush|onthefly)"; exit 1 ;;
+    instantsplat|splatfacto|gsplat|2dgs|brush|spirula|onthefly) ;;
+    *) echo "Error: unknown --trainer '$TRAINER' (instantsplat|splatfacto|gsplat|2dgs|brush|spirula|onthefly)"; exit 1 ;;
 esac
+
+# Spirula trains from a COLMAP model, like Brush's COLMAP loader, so only those SfM paths can feed it.
+if [[ "$TRAINER" == "spirula" ]] && ! is_colmap_sfm && [[ "$SFM" != "preposed_colmap" && "$SFM" != "pose_prior" ]]; then
+    echo "Error: --trainer spirula needs a COLMAP model (--sfm $COLMAP_SFMS preposed_colmap pose_prior), not --sfm $SFM"; exit 1
+fi
+SPIRULA_BIN="${SPIRULA_BIN:-/home/communications/workdir/spirula-studio/spirula}"
 
 # SfM feature-extraction cap: must be a positive integer, since it is spliced
 # straight into the COLMAP command line at three call sites.
@@ -399,8 +410,8 @@ if [[ "$SFM" == "preposed" ]]; then
     [[ ! -d "$PREPOSED_DIR/images" ]] && { echo "Error: $PREPOSED_DIR/images not found"; exit 1; }
     SKIP_EXTRACTION=1
     case "$TRAINER" in
-        brush|gsplat|2dgs|splatfacto) ;;
-        *) echo "Error: --sfm preposed does not support --trainer $TRAINER (supported: brush, gsplat, 2dgs, splatfacto)"; exit 1 ;;
+        brush|spirula|gsplat|2dgs|splatfacto) ;;
+        *) echo "Error: --sfm preposed does not support --trainer $TRAINER (supported: brush, spirula, gsplat, 2dgs, splatfacto)"; exit 1 ;;
     esac
 fi
 # --sfm pose_prior: seed COLMAP's mapper with the phone's ARKit poses instead of letting it
@@ -417,8 +428,8 @@ if [[ "$SFM" == "pose_prior" ]]; then
         [[ -e "$ARKIT_DIR/$_f" ]] || { echo "Error: $ARKIT_DIR/$_f not found"; exit 1; }
     done
     case "$TRAINER" in
-        brush|gsplat|2dgs|splatfacto) ;;
-        *) echo "Error: --sfm pose_prior does not support --trainer $TRAINER (supported: brush, gsplat, 2dgs, splatfacto)"; exit 1 ;;
+        brush|spirula|gsplat|2dgs|splatfacto) ;;
+        *) echo "Error: --sfm pose_prior does not support --trainer $TRAINER (supported: brush, spirula, gsplat, 2dgs, splatfacto)"; exit 1 ;;
     esac
     # COLMAP 4.x only: 3.9.1 has no pose_prior_mapper and its SIFT descriptors are
     # incompatible with 4.x, so the whole chain must stay on one generation.
@@ -454,8 +465,8 @@ if [[ "$SFM" == "preposed_colmap" ]]; then
     [[ ! -d "$PREPOSED_DIR/images" ]] && { echo "Error: $PREPOSED_DIR/images not found"; exit 1; }
     SKIP_EXTRACTION=1
     case "$TRAINER" in
-        brush|gsplat|2dgs|splatfacto) ;;
-        *) echo "Error: --sfm preposed_colmap does not support --trainer $TRAINER (supported: brush, gsplat, 2dgs, splatfacto)"; exit 1 ;;
+        brush|spirula|gsplat|2dgs|splatfacto) ;;
+        *) echo "Error: --sfm preposed_colmap does not support --trainer $TRAINER (supported: brush, spirula, gsplat, 2dgs, splatfacto)"; exit 1 ;;
     esac
 fi
 
@@ -630,6 +641,34 @@ emit_event "{\"event\":\"frames_extracted\",\"total_frames\":$TOTAL_FRAMES}"
 # therefore needs one run per device, each with --image_list_path for that device's images
 # and its own --ImageReader.camera_params. The server writes camera_groups.json beside the
 # images when a job declares groups; without it this behaves exactly as before.
+# Swap the scene to undistorted: PINHOLE sparse/0 + undistorted images, so every trainer sees a plain
+# PINHOLE scene. The pod keeps this PINHOLE model but the DISTORTED upload in images/ -- a pair that
+# does not match (fork-training 44668193 trained on exactly that mismatch, -1.5 dB).
+undistort_to_pinhole() {
+    echo "    Undistorting images ($1 → PINHOLE)..."
+    # Keep the DISTORTED model in the pod: it is the one that pairs with the pod's images/ (the upload),
+    # so a fork can retrain from it -- the undistorted images themselves are scratch and get deleted.
+    rm -rf "$MODEL_DIR/sparse_distorted"
+    mkdir -p "$MODEL_DIR/sparse_distorted"
+    cp -rL "$SPARSE_PARENT/0" "$MODEL_DIR/sparse_distorted/0"
+    local UNDIST_DIR="$SCENE_DIR/undistorted"
+    rm -rf "$UNDIST_DIR"
+    "$COLMAP_BIN" image_undistorter \
+        --image_path "$IMAGE_DIR" \
+        --input_path "$SPARSE_PARENT/0" \
+        --output_path "$UNDIST_DIR" \
+        --output_type COLMAP \
+        2>&1 | tee "$MODEL_DIR/01d2_undistort.log"
+    [[ -f "$UNDIST_DIR/sparse/cameras.bin" ]] || { echo "Error: image_undistorter failed. Check $MODEL_DIR/01d2_undistort.log"; exit 1; }
+    rm -rf "$SCENE_DIR/images_distorted"
+    mv "$IMAGE_DIR" "$SCENE_DIR/images_distorted"
+    mv "$UNDIST_DIR/images" "$IMAGE_DIR"
+    rm -rf "$SPARSE_PARENT/0"
+    mkdir -p "$SPARSE_PARENT/0"
+    mv "$UNDIST_DIR"/sparse/* "$SPARSE_PARENT/0/"
+    rm -rf "$UNDIST_DIR"
+}
+
 run_feature_extraction() {
     local _log="$1"
     local _FEAT_TYPE_ARG=()
@@ -891,26 +930,7 @@ PYCOMP
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_colmap_filter.log"
 
-    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then
-        echo "    Undistorting images ($CAMERA_MODEL → PINHOLE)..."
-        UNDIST_DIR="$SCENE_DIR/undistorted"
-        rm -rf "$UNDIST_DIR"
-        "$COLMAP_BIN" image_undistorter \
-            --image_path "$IMAGE_DIR" \
-            --input_path "$SPARSE_PARENT/0" \
-            --output_path "$UNDIST_DIR" \
-            --output_type COLMAP \
-            2>&1 | tee "$MODEL_DIR/01d2_undistort.log"
-        [[ -f "$UNDIST_DIR/sparse/cameras.bin" ]] || { echo "Error: image_undistorter failed. Check $MODEL_DIR/01d2_undistort.log"; exit 1; }
-        # Swap scene to undistorted: pinhole sparse + undistorted images (trainers see a plain PINHOLE scene)
-        rm -rf "$SCENE_DIR/images_distorted"
-        mv "$IMAGE_DIR" "$SCENE_DIR/images_distorted"
-        mv "$UNDIST_DIR/images" "$IMAGE_DIR"
-        rm -rf "$SPARSE_PARENT/0"
-        mkdir -p "$SPARSE_PARENT/0"
-        mv "$UNDIST_DIR"/sparse/* "$SPARSE_PARENT/0/"
-        rm -rf "$UNDIST_DIR"
-    fi
+    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then undistort_to_pinhole "$CAMERA_MODEL"; fi
 
 elif [[ "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" ]]; then
     echo "[2/3] COLMAP features + matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
@@ -980,26 +1000,7 @@ PYCOMP
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01d_glomap_filter.log"
 
-    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then
-        echo "    Undistorting images ($CAMERA_MODEL → PINHOLE)..."
-        UNDIST_DIR="$SCENE_DIR/undistorted"
-        rm -rf "$UNDIST_DIR"
-        "$COLMAP_BIN" image_undistorter \
-            --image_path "$IMAGE_DIR" \
-            --input_path "$SPARSE_PARENT/0" \
-            --output_path "$UNDIST_DIR" \
-            --output_type COLMAP \
-            2>&1 | tee "$MODEL_DIR/01d2_undistort.log"
-        [[ -f "$UNDIST_DIR/sparse/cameras.bin" ]] || { echo "Error: image_undistorter failed. Check $MODEL_DIR/01d2_undistort.log"; exit 1; }
-        # Swap scene to undistorted: pinhole sparse + undistorted images (trainers see a plain PINHOLE scene)
-        rm -rf "$SCENE_DIR/images_distorted"
-        mv "$IMAGE_DIR" "$SCENE_DIR/images_distorted"
-        mv "$UNDIST_DIR/images" "$IMAGE_DIR"
-        rm -rf "$SPARSE_PARENT/0"
-        mkdir -p "$SPARSE_PARENT/0"
-        mv "$UNDIST_DIR"/sparse/* "$SPARSE_PARENT/0/"
-        rm -rf "$UNDIST_DIR"
-    fi
+    if [[ "$CAMERA_MODEL" != "PINHOLE" ]]; then undistort_to_pinhole "$CAMERA_MODEL"; fi
 
 
     # Persist remapped database for query-image localization.
@@ -1423,6 +1424,22 @@ print(f'  → text→binary: {len(r.cameras)} cameras, {len(r.images)} images, {
         while read -r _img; do ln -sfn "$_img" "$SCENE_DIR/images/$(basename "$_img")"; done
     IMAGE_DIR="$SCENE_DIR/images"
 
+elif [[ "$SFM" == "spirula" ]]; then
+    # Spirula Studio's own SfM (`spirula sfm auto`). It solves its own lens (OPENCV), so the model is
+    # undistorted to PINHOLE like our COLMAP paths and every trainer gets the same kind of scene.
+    echo "[2/3] Spirula SfM ($TOTAL_FRAMES frames)..."
+    SPARSE_PARENT="$SCENE_DIR/sparse"
+    _SP_IN="$SCENE_DIR/spirula_in"; _SP_WS="$SCENE_DIR/spirula_ws"
+    rm -rf "$SPARSE_PARENT" "$_SP_IN" "$_SP_WS"
+    mkdir -p "$_SP_IN" "$SPARSE_PARENT"
+    ln -sfn "$IMAGE_DIR" "$_SP_IN/images"      # it scans the whole folder: hand it ONLY the images
+    "$SPIRULA_BIN" sfm auto "$_SP_IN" -o "$_SP_WS" 2>&1 | tee "$MODEL_DIR/01_spirula_sfm.log"
+    [[ -f "$_SP_WS/sparse/0/cameras.bin" ]] || { echo "Error: spirula sfm produced no sparse/0. Check $MODEL_DIR/01_spirula_sfm.log"; exit 1; }
+    mv "$_SP_WS/sparse/0" "$SPARSE_PARENT/0"
+    rm -rf "$_SP_IN" "$_SP_WS"
+    _SP_MODEL=$("$PYTHON" -c "import pycolmap,sys;print({c.model.name for c in pycolmap.Reconstruction(sys.argv[1]).cameras.values()}.pop())" "$SPARSE_PARENT/0")
+    if [[ "$_SP_MODEL" != "PINHOLE" ]]; then undistort_to_pinhole "$_SP_MODEL"; fi
+
 elif [[ "$SFM" == "preposed" ]]; then
     echo "[2/3] SfM skipped — converting nerfstudio poses → COLMAP sparse from $PREPOSED_DIR"
     SPARSE_PARENT="$MODEL_DIR/sparse"
@@ -1442,6 +1459,22 @@ elif [[ "$SFM" == "preposed" ]]; then
     ln -sfn "$SPARSE_PARENT" "$SCENE_DIR/sparse" 2>/dev/null || true
 elif [[ "$SFM" == "preposed_colmap" ]]; then
     echo "[SfM] Reusing COLMAP sparse from $PREPOSED_DIR/sparse/0"
+    # The model must describe THESE images. A pod's sparse/0 is undistorted (PINHOLE, cropped) while its
+    # images/ are the distorted upload; fork 44668193 trained exactly that pair and lost 1.5 dB silently.
+    _PC_CAM=$("$PYTHON" -c "
+import os, sys, pycolmap
+from PIL import Image
+r = pycolmap.Reconstruction(sys.argv[1]); im = next(iter(r.images.values())); c = r.cameras[im.camera_id]
+w, h = Image.open(os.path.join(sys.argv[2], im.name)).size
+print(c.model.name, 'ok' if (w, h) == (c.width, c.height) else f'MISMATCH model {c.width}x{c.height} vs image {w}x{h} ({im.name})')
+" "$PREPOSED_DIR/sparse/0" "$IMAGE_DIR")
+    [[ "$_PC_CAM" == *" ok" ]] || { echo "Error: --preposed-dir sparse/0 does not match its images: $_PC_CAM"; exit 1; }
+    # A distorted model (OPENCV from a pod's sparse_distorted/, or Spirula's SfM) is undistorted here,
+    # exactly as the SfM paths do, so every trainer gets a PINHOLE scene.
+    if [[ "${_PC_CAM% *}" != "PINHOLE" ]]; then
+        SPARSE_PARENT="$PREPOSED_DIR/sparse"
+        undistort_to_pinhole "${_PC_CAM% *}"
+    fi
     SPARSE_PARENT="$MODEL_DIR/sparse"
     mkdir -p "$SPARSE_PARENT"
     ln -sfn "$PREPOSED_DIR/sparse/0" "$SPARSE_PARENT/0"
@@ -1481,7 +1514,7 @@ else
         2>&1 | tee "$MODEL_DIR/01_init_geo.log"
 fi
 # Export sparse point cloud as PLY for browser preview
-if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+if is_colmap_sfm; then
     _PC_SRC="$SCENE_DIR/sparse/0"
 else
     _PC_SRC="$SCENE_DIR/sparse_${TOTAL_FRAMES}/0"
@@ -1494,9 +1527,7 @@ if [[ -d "$_PC_SRC" ]]; then
 fi
 
 # Copy COLMAP sparse into pod so it is self-contained for LichtFeld / re-training
-if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || \
-      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
-      "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+if is_colmap_sfm; then
     if [[ -d "$SPARSE_PARENT" ]]; then
         cp -r "$SPARSE_PARENT" "$MODEL_DIR/"
         # Copy the COLMAP feature/match database so the pod is a complete COLMAP
@@ -1603,7 +1634,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
     # gsplat via InstantSplat/simple_trainer.py — already proven on this 8GB machine
     # preposed: force MCMC (default strategy FPEs during densification with dense PLY init)
     [[ "$SFM" == "preposed" || "$SFM" == "preposed_colmap" ]] && MCMC=1
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_loma" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    ! is_colmap_sfm && [[ "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames, mcmc=$MCMC, post_processing=${GSPLAT_POST_PROCESSING:-none})..."
     _GSPLAT_PP_ARGS=()
@@ -1678,7 +1709,7 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         --out        "$MODEL_DIR/initial_camera.json" \
         2>/dev/null || true
 elif [[ "$TRAINER" == "2dgs" ]]; then
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_loma" && "$SFM" != "glomap_aliked" && "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
+    ! is_colmap_sfm && [[ "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     GSPLAT_OUT="$MODEL_DIR/gsplat_output"
     _GS_REFINE_STOP=$(( ITERS / 2 ))
     echo "[2/3] 2DGS training ($ITERS iterations, $TOTAL_FRAMES frames)..."
@@ -1709,10 +1740,7 @@ elif [[ "$TRAINER" == "2dgs" ]]; then
 elif [[ "$TRAINER" == "brush" ]]; then
     # Brush: Rust-based MCMC-style trainer; headless by default (no --with-viewer).
     # Accepts COLMAP or nerfstudio format (auto-detected from scene_dir).
-    [[ "$SFM" != "colmap_sift" && "$SFM" != "glomap_sift" && "$SFM" != "glomap_loma" && "$SFM" != "glomap_aliked" && \
-       "$SFM" != "glomap_loftr" && "$SFM" != "glomap_dedode" && "$SFM" != "glomap_disk" && "$SFM" != "glomap_superpoint" && \
-       "$SFM" != "colmap_aliked" && "$SFM" != "fastmap" && "$SFM" != "realityscan" && \
-       "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && \
+    ! is_colmap_sfm && [[ "$SFM" != "preposed" && "$SFM" != "preposed_colmap" ]] && \
         ln -sfn "sparse_${TOTAL_FRAMES}" "$SCENE_DIR/sparse" 2>/dev/null || true
     BRUSH_BIN="${BRUSH_BIN:-/home/communications/workdir/brush-main/bin/brush-554}"
     BRUSH_OUT="$MODEL_DIR/brush_output"
@@ -1800,14 +1828,39 @@ elif [[ "$TRAINER" == "brush" ]]; then
         --splat      "$(ls "$MODEL_DIR"/*.splat 2>/dev/null | head -1)" \
         --out        "$MODEL_DIR/initial_camera.json" \
         2>/dev/null || true
+elif [[ "$TRAINER" == "spirula" ]]; then
+    # Spirula Studio's trainer (default 3dgs preset). Same held-out split as Brush (every 8th image), so the
+    # PSNR in /history means the same thing for both.
+    _SP_SCENE="$SCENE_DIR"
+    [[ "$SFM" == "preposed_colmap" ]] && _SP_SCENE="$MODEL_DIR"
+    # Spirula has no max-resolution flag, only a divisor. Brush trains at <= TRAIN_MAX_IMAGE_SIZE, so refuse
+    # rather than silently train the two at different resolutions.
+    _SP_MAXSIDE=$("$PYTHON" -c "import sys,os;from PIL import Image;d=sys.argv[1];print(max(Image.open(os.path.join(d,sorted(os.listdir(d))[0])).size))" "$_SP_SCENE/images")
+    (( _SP_MAXSIDE <= TRAIN_MAX_IMAGE_SIZE )) || { echo "Error: --trainer spirula: images are ${_SP_MAXSIDE}px, above --train-image-size $TRAIN_MAX_IMAGE_SIZE (Spirula cannot cap resolution)"; exit 1; }
+    SPIRULA_OUT="$MODEL_DIR/spirula_output"
+    rm -rf "$SPIRULA_OUT"
+    echo "[2/3] Spirula training ($ITERS iterations, $TOTAL_FRAMES frames, ${_SP_MAXSIDE}px)..."
+    "$SPIRULA_BIN" train 3dgs --data "$_SP_SCENE" \
+        --data-format colmap --colmap-recon-dir sparse/0 \
+        --num-iterations "$ITERS" --eval-mode interval --eval-interval 8 \
+        --scene-center none \
+        --disable-viewer 1 --keep-viewer-alive 0 \
+        --output-dir-prefix "$MODEL_DIR" --output-dir-name spirula_output \
+        2>&1 | tee "$MODEL_DIR/02_train.log"
+    [[ -f "$SPIRULA_OUT/step-$(printf %09d "$ITERS").ckpt/splat.ply" ]] || { echo "Error: Spirula wrote no splat.ply for iter $ITERS in $SPIRULA_OUT"; exit 1; }
+    # --scene-center none keeps the splats in the SfM's world frame; prove it, since every viewer and
+    # /carpet read the PLY in that frame.
+    "$PYTHON" -c "import json,sys;t=json.load(open(sys.argv[1]))['world_from_train']['matrix_4x4'];sys.exit(t!=[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]])" "$SPIRULA_OUT/scene_transform.json" \
+        || { echo "Error: Spirula trained in a non-identity frame ($SPIRULA_OUT/scene_transform.json)"; exit 1; }
+    SPARSE_PARENT="$SCENE_DIR/sparse"
 else
     # instantsplat trainer
     # train.py looks for sparse_{N}/0/ — COLMAP/GLOMAP/FastMap write sparse/0/ instead;
     # symlink sparse_N → sparse so the scene loader finds it.
-    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && ln -sfn "sparse" "$SCENE_DIR/sparse_${TOTAL_FRAMES}" 2>/dev/null || true
+    is_colmap_sfm && ln -sfn "sparse" "$SCENE_DIR/sparse_${TOTAL_FRAMES}" 2>/dev/null || true
     # --pp_optimizer requires confidence_dsp.npy from init_geo.py (MASt3R/Fast3R only)
     PP_OPT_ARG="--pp_optimizer"
-    [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]] && PP_OPT_ARG=""
+    is_colmap_sfm && PP_OPT_ARG=""
     CUDA_VISIBLE_DEVICES=0 "$PYTHON" ./train.py \
         -s "$SCENE_DIR" \
         -m "$MODEL_DIR" \
@@ -1861,6 +1914,9 @@ elif [[ "$TRAINER" == "2dgs" ]]; then
     ACTUAL_ITER=$ITERS
 elif [[ "$TRAINER" == "brush" ]]; then
     PLY=$(find "$MODEL_DIR/brush_output" -name "*.ply" 2>/dev/null | sort | tail -1)
+    ACTUAL_ITER=$ITERS
+elif [[ "$TRAINER" == "spirula" ]]; then
+    PLY="$MODEL_DIR/spirula_output/step-$(printf %09d "$ITERS").ckpt/splat.ply"
     ACTUAL_ITER=$ITERS
 elif [[ "$TRAINER" == "splatfacto" ]]; then
     NS_CONFIG=$(find "$MODEL_DIR/ns_train" -name "config.yml" 2>/dev/null | sort | tail -1)
@@ -1970,9 +2026,7 @@ fi
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 # Remove sparse from assets/examples — canonical copy is now in the pod
-if [[ "$SFM" == "colmap_sift" || "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" || "$SFM" == "glomap_aliked" || \
-      "$SFM" == "glomap_loftr" || "$SFM" == "glomap_dedode" || "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || \
-      "$SFM" == "colmap_aliked" || "$SFM" == "fastmap" || "$SFM" == "realityscan" ]]; then
+if is_colmap_sfm; then
     [[ -d "$SPARSE_PARENT" ]] && rm -rf "$SPARSE_PARENT"
 fi
 

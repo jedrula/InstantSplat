@@ -294,6 +294,18 @@ def extract_brush_metrics(pod_dir: str) -> dict:
     return result
 
 
+def extract_spirula_metrics(pod_dir: str) -> dict:
+    """Spirula writes per-eval-view lists to spirula_output/metrics.json; its own summary is their mean.
+    psnr/ssim are the plain ones, comparable with Brush. cc_psnr is Spirula's colour-corrected PSNR
+    (it fits a colour transform per view first) -- kept separately, it is not comparable."""
+    path = os.path.join(pod_dir, "spirula_output", "metrics.json")
+    if not os.path.exists(path):
+        return {}
+    m = json.load(open(path))
+    mean = lambda k: round(sum(m[k]) / len(m[k]), 4)
+    return {"psnr": mean("psnr"), "ssim": mean("ssim"), "cc_psnr": mean("cc_psnr")}
+
+
 def extract_brush_curve(pod_dir: str) -> dict:
     """Peak-vs-shipped from the Brush eval curve. See extract_brush_metrics for why."""
     import re
@@ -333,6 +345,8 @@ def extract_ply_health(pod_dir: str, sparse_dir=None) -> dict:
         from plyfile import PlyData
         plys = sorted(_g.glob(os.path.join(pod_dir, "brush_output", "export_*.ply")),
                       key=lambda p: int(_re.findall(r"(\d+)", os.path.basename(p))[-1] or 0))
+        if not plys:
+            plys = sorted(_g.glob(os.path.join(pod_dir, "spirula_output", "step-*.ckpt", "splat.ply")))
         if not plys:
             plys = sorted(_g.glob(os.path.join(pod_dir, "point_cloud", "iteration_*", "point_cloud.ply")))
         if plys:
@@ -572,6 +586,8 @@ def main():
         for key in ("psnr", "ssim", "lpips", "train_loss"):
             if key in gsplat:
                 metrics[key] = gsplat[key]
+        if "psnr" not in metrics:
+            metrics.update(extract_spirula_metrics(pod_dir))
         if "psnr" not in metrics:
             brush = extract_brush_metrics(pod_dir)
             metrics.update(brush)
