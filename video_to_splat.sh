@@ -1843,6 +1843,11 @@ elif [[ "$TRAINER" == "spirula" ]]; then
     (( _SP_MAXSIDE <= TRAIN_MAX_IMAGE_SIZE )) || { echo "Error: --trainer spirula: images are ${_SP_MAXSIDE}px, above --train-image-size $TRAIN_MAX_IMAGE_SIZE (Spirula cannot cap resolution)"; exit 1; }
     SPIRULA_OUT="$MODEL_DIR/spirula_output"
     rm -rf "$SPIRULA_OUT"
+    # The API/UI field is still named brush_extra_args; it is "extra flags for the trainer" and reaches
+    # Spirula too. Appended last, so they override the defaults above (e.g. --use-bilateral-grid 0).
+    _SP_EXTRA=()
+    [[ -n "${BRUSH_EXTRA_ARGS:-}" ]] && read -ra _SP_EXTRA <<< "$BRUSH_EXTRA_ARGS"
+    echo "    Spirula extra flags: ${_SP_EXTRA[*]:-(none)}"
     echo "[2/3] Spirula training ($ITERS iterations, $TOTAL_FRAMES frames, ${_SP_MAXSIDE}px)..."
     "$SPIRULA_BIN" train 3dgs --data "$_SP_SCENE" \
         --data-format colmap --colmap-recon-dir sparse/0 \
@@ -1850,6 +1855,7 @@ elif [[ "$TRAINER" == "spirula" ]]; then
         --scene-center none \
         --disable-viewer 1 --keep-viewer-alive 0 \
         --output-dir-prefix "$MODEL_DIR" --output-dir-name spirula_output \
+        "${_SP_EXTRA[@]}" \
         2>&1 | tee "$MODEL_DIR/02_train.log"
     [[ -f "$SPIRULA_OUT/step-$(printf %09d "$ITERS").ckpt/splat.ply" ]] || { echo "Error: Spirula wrote no splat.ply for iter $ITERS in $SPIRULA_OUT"; exit 1; }
     # --scene-center none keeps the splats in the SfM's world frame; prove it, since every viewer and
