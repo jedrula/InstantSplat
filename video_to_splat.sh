@@ -1835,6 +1835,9 @@ elif [[ "$TRAINER" == "brush" ]]; then
 elif [[ "$TRAINER" == "spirula" ]]; then
     # Spirula Studio's trainer (default 3dgs preset). Same held-out split as Brush (every 8th image), so the
     # PSNR in /history means the same thing for both.
+    # Per-photo colour correction OFF: Spirula's bilateral grid + PPISP live only inside training and are not
+    # in the exported PLY, so every viewer sees uncorrected colour -- -1.7 dB on f5ea283a (96e346a2 24.90 vs
+    # 109ff094 26.56 on the shared scorer; off == Brush's 26.57). Pass them back on via the extra flags.
     _SP_SCENE="$SCENE_DIR"
     [[ "$SFM" == "preposed_colmap" ]] && _SP_SCENE="$MODEL_DIR"
     # Spirula has no max-resolution flag, only a divisor. Brush trains at <= TRAIN_MAX_IMAGE_SIZE, so refuse
@@ -1853,6 +1856,7 @@ elif [[ "$TRAINER" == "spirula" ]]; then
         --data-format colmap --colmap-recon-dir sparse/0 \
         --num-iterations "$ITERS" --eval-mode interval --eval-interval 8 \
         --scene-center none \
+        --use-bilateral-grid 0 --use-ppisp 0 \
         --disable-viewer 1 --keep-viewer-alive 0 \
         --output-dir-prefix "$MODEL_DIR" --output-dir-name spirula_output \
         "${_SP_EXTRA[@]}" \
