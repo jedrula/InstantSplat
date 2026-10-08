@@ -1444,10 +1444,27 @@ elif [[ "$SFM" == "spirula" ]]; then
         "")              _SP_SEQ=() ;;
         sequential_loop) _SP_SEQ=(--sequence .) ;;
         sequential)      _SP_SEQ=(--sequence . --pairs sequential --no-loop-closure) ;;
-        *) echo "Error: --sfm spirula has no equivalent of --colmap-matcher $COLMAP_MATCHER (use '', sequential, sequential_loop)"; exit 1 ;;
+        # Look-alike pairs, but only where ARKit says the two photos could overlap: on identical facades
+        # the look-alikes fold the model (3cc96e15), and without them a fast turn splits the walk into
+        # models nothing can rejoin (92b1e093). `auto` cannot filter pairs, so its stages run one by one
+        # with the same presets (--max-image-size 2400 is what --quality high set; standalone `match` defaults to
+        # exhaustive, auto picked prefilter) and the gate between.
+        arkit_gated)
+            [[ -f "$ARKIT_DIR/frames.traj" ]] || { echo "Error: --colmap-matcher arkit_gated needs --arkit-dir with frames.traj"; exit 1; }
+            _SP_SEQ=(--sequence .) ;;
+        *) echo "Error: --sfm spirula has no equivalent of --colmap-matcher $COLMAP_MATCHER (use '', sequential, sequential_loop, arkit_gated)"; exit 1 ;;
     esac
     echo "    Spirula SfM flags: ${_SP_SEQ[*]:-(auto pairs)}"
-    "$SPIRULA_BIN" sfm auto "$_SP_IN" -o "$_SP_WS" "${_SP_SEQ[@]}" 2>&1 | tee "$MODEL_DIR/01_spirula_sfm.log"
+    if [[ "$COLMAP_MATCHER" == "arkit_gated" ]]; then
+        mkdir -p "$_SP_WS"
+        { "$SPIRULA_BIN" sfm extract "$_SP_IN/images" -o "$_SP_WS/features" --max-image-size 2400 &&
+          "$SPIRULA_BIN" sfm match "$_SP_WS/features" -o "$_SP_WS/matches.bin" --pairs prefilter "${_SP_SEQ[@]}" &&
+          "$PYTHON" "$REPO/spirula_gate_pairs.py" "$_SP_WS/matches.bin" "$ARKIT_DIR/frames.traj" "$SPATIAL_MAX_DISTANCE" 10 &&
+          "$SPIRULA_BIN" sfm map "$_SP_WS/matches.bin" "$_SP_WS/features" -o "$_SP_WS/sparse" --images "$_SP_IN/images" "${_SP_SEQ[@]}"
+        } 2>&1 | tee "$MODEL_DIR/01_spirula_sfm.log"
+    else
+        "$SPIRULA_BIN" sfm auto "$_SP_IN" -o "$_SP_WS" "${_SP_SEQ[@]}" 2>&1 | tee "$MODEL_DIR/01_spirula_sfm.log"
+    fi
     [[ -f "$_SP_WS/sparse/0/cameras.bin" ]] || { echo "Error: spirula sfm produced no sparse/0. Check $MODEL_DIR/01_spirula_sfm.log"; exit 1; }
     mv "$_SP_WS/sparse/0" "$SPARSE_PARENT/0"
     rm -rf "$_SP_IN" "$_SP_WS"
@@ -1792,10 +1809,15 @@ elif [[ "$TRAINER" == "brush" ]]; then
     # dataset limit. Losing a 50-minute run for the last 200k splats is a bad trade, so the
     # default now sits just under the observed failure rather than just under the measured
     # ceiling. Raise it per-dataset with BRUSH_MAX_SPLATS once you have measured that dataset.
+    #
+    # 2026-10-08: 2.7M still lost runs. Four OOMs clustered at 2.59-2.70M whatever the photo count
+    # (70ef518f 1994 photos @2.59M, the 380-photo 30k fork @2.64M, 3e22e000 785 @2.68M, 352d6933
+    # @2.70M), so the cap does not need to scale with images -- it was simply ~10% too high. 2.4M
+    # sits under all four; the 160-photo budget curve knees at ~2.5M, so little quality is lost.
     # Override with BRUSH_MAX_SPLATS=N, or an explicit --max-splats in
     # --brush-extra-args (checked here so we never pass the flag twice).
     if [[ " ${_BRUSH_EXTRA[*]} " != *" --max-splats "* && " ${_BRUSH_EXTRA[*]} " != *" --max-splats="* ]]; then
-        _BRUSH_EXTRA+=(--max-splats "${BRUSH_MAX_SPLATS:-2700000}")
+        _BRUSH_EXTRA+=(--max-splats "${BRUSH_MAX_SPLATS:-2400000}")
     fi
     # Training resolution. Always passed explicitly so the run records what it trained at
     # instead of inheriting Brush's silent 1920 default. Skipped when the caller set it.
