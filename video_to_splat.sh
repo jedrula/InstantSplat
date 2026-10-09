@@ -105,6 +105,9 @@ COLMAP_MATCHER=""
 # radius over which two photos could plausibly see the same ground.
 SPATIAL_MAX_NEIGHBORS=50
 SPATIAL_MAX_DISTANCE=100
+DISAMBIGUATE=""      # glomap_sift, comma list run in order: arkit = SLAM-style loop check vs --arkit-dir odometry (loop_verify.py),
+                     # dpp = Doppelgangers++ classifier (dg_filter.py, research licence)
+DG_THRESHOLD=0.8
 # hloc retrieval neighbours per image for the learned-feature SfM paths (glomap_aliked etc.
 # with --colmap-matcher unset or vocab_tree). hloc's own default of 25 capped the Plac
 # Staszica run at 19,625 pairs and starved the trainer (obs/image 1204 -> 752, floaters
@@ -256,6 +259,8 @@ while [[ $# -gt 0 ]]; do
         --colmap-matcher)   COLMAP_MATCHER="$2"; shift 2 ;;
         --spatial-max-neighbors) SPATIAL_MAX_NEIGHBORS="$2"; shift 2 ;;
         --spatial-max-distance)  SPATIAL_MAX_DISTANCE="$2";  shift 2 ;;
+        --disambiguate)          DISAMBIGUATE="$2";          shift 2 ;;
+        --dg-threshold)          DG_THRESHOLD="$2";          shift 2 ;;
         --hloc-retrieval-k)      HLOC_RETRIEVAL_K="$2";      shift 2 ;;
         --colmap-bin)       COLMAP_BIN="$2";     shift 2 ;;
         --camera-model)     CAMERA_MODEL="$2"; shift 2 ;;
@@ -306,6 +311,16 @@ case "$TRAINER" in
 esac
 
 # Spirula trains from a COLMAP model, like Brush's COLMAP loader, so only those SfM paths can feed it.
+if [[ -n "$DISAMBIGUATE" ]]; then
+    [[ "$SFM" == "glomap_sift" ]] || { echo "Error: --disambiguate is wired into --sfm glomap_sift only, not $SFM"; exit 1; }
+    for _d in ${DISAMBIGUATE//,/ }; do
+        case "$_d" in
+            dpp) ;;
+            arkit) [[ -f "$ARKIT_DIR/frames.traj" ]] || { echo "Error: --disambiguate arkit needs --arkit-dir with frames.traj"; exit 1; } ;;
+            *) echo "Error: unknown --disambiguate step '$_d' (arkit, dpp)"; exit 1 ;;
+        esac
+    done
+fi
 if [[ "$TRAINER" == "spirula" ]] && ! is_colmap_sfm && [[ "$SFM" != "preposed_colmap" && "$SFM" != "pose_prior" ]]; then
     echo "Error: --trainer spirula needs a COLMAP model (--sfm $COLMAP_SFMS preposed_colmap pose_prior), not --sfm $SFM"; exit 1
 fi
@@ -953,6 +968,19 @@ elif [[ "$SFM" == "glomap_sift" || "$SFM" == "glomap_loma" ]]; then
     run_feature_extraction 01a_glomap_features.log
 
     run_matcher 01b_glomap_match.log
+
+    # Look-alike pairs out before mapping, in the order given (arkit first is cheaper: it shrinks what dpp must score).
+    for _d in ${DISAMBIGUATE//,/ }; do
+        if [[ "$_d" == "arkit" ]]; then
+            echo "    Loop check vs ARKit (within $SPATIAL_MAX_DISTANCE m, consistent relative pose)..."
+            "$PYTHON" "$REPO/loop_verify.py" "$DB_PATH" "$ARKIT_DIR/frames.traj" "$SPATIAL_MAX_DISTANCE" 2>&1 | tee "$MODEL_DIR/01b3_loop_verify.log"
+            [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "Error: loop_verify.py failed. Check $MODEL_DIR/01b3_loop_verify.log"; exit 1; }
+        else
+            echo "    Doppelgangers++ (threshold $DG_THRESHOLD): deleting look-alike pairs..."
+            "$PYTHON" "$REPO/dg_filter.py" "$DB_PATH" "$IMAGE_DIR" --threshold "$DG_THRESHOLD" 2>&1 | grep -v "cuda-compiled version of RoPE2D" | tee "$MODEL_DIR/01b4_dg_filter.log"
+            [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "Error: dg_filter.py failed. Check $MODEL_DIR/01b4_dg_filter.log"; exit 1; }
+        fi
+    done
 
     if [[ "$VIEW_GRAPH_CALIBRATOR" == "1" ]]; then
         echo "    Running view_graph_calibrator (focal length estimation)..."
