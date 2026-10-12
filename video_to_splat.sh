@@ -1698,6 +1698,8 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
     echo "[2/3] gsplat training ($ITERS iterations, $TOTAL_FRAMES frames, mcmc=$MCMC, post_processing=${GSPLAT_POST_PROCESSING:-none})..."
     _GSPLAT_PP_ARGS=()
     [[ -n "$GSPLAT_POST_PROCESSING" ]] && _GSPLAT_PP_ARGS=(--post-processing "$GSPLAT_POST_PROCESSING")
+    # PPISP models exposure from the photos' EXIF (shutter x ISO); without it held-out views get no exposure at all.
+    [[ "$GSPLAT_POST_PROCESSING" == "ppisp" ]] && _GSPLAT_PP_ARGS+=(--load-exposure)
     [[ "$BILATERAL_GRID_FUSED" == "1" && "$GSPLAT_POST_PROCESSING" == "bilateral_grid" ]] && _GSPLAT_PP_ARGS+=(--bilateral-grid-fused)
     [[ "$RANDOM_BKGD" == "1" ]] && _GSPLAT_PP_ARGS+=(--random-bkgd)
     if [[ "$MCMC" == "1" ]]; then
@@ -1709,8 +1711,6 @@ elif [[ "$TRAINER" == "gsplat" ]]; then
         [[ -n "$VIEWER_PORT" ]] && _GSPLAT_VIEWER_ARGS+=("--port" "$VIEWER_PORT")
         PYTHONPATH="$REPO/../gsplat/examples" TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "$PYTHON" "$REPO/../gsplat/examples/simple_trainer.py" mcmc \
             --data-dir "$SCENE_DIR" \
-    # PPISP models exposure from the photos' EXIF (shutter x ISO); without it held-out views get no exposure at all.
-    [[ "$GSPLAT_POST_PROCESSING" == "ppisp" ]] && _GSPLAT_PP_ARGS+=(--load-exposure)
             --data-factor "${GSPLAT_DATA_FACTOR:-1}" \
             "${_GS_OPT_ARGS[@]}" \
             --result-dir "$GSPLAT_OUT" \
