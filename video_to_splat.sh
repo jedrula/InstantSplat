@@ -108,6 +108,8 @@ SPATIAL_MAX_DISTANCE=100
 DISAMBIGUATE=""      # glomap_sift, comma list run in order: arkit = SLAM-style loop check vs --arkit-dir odometry (loop_verify.py),
                      # dpp = Doppelgangers++ classifier (dg_filter.py, research licence)
 DG_THRESHOLD=0.8
+NORMALIZE_EXPOSURE=0 # brush only: train on exposure/WB-normalised copies of the photos (normalize_exposure.py)
+INIT_FROM=""         # brush only: a previous pod in the SAME world; start from its last Brush export instead of SfM points
 # hloc retrieval neighbours per image for the learned-feature SfM paths (glomap_aliked etc.
 # with --colmap-matcher unset or vocab_tree). hloc's own default of 25 capped the Plac
 # Staszica run at 19,625 pairs and starved the trainer (obs/image 1204 -> 752, floaters
@@ -261,6 +263,8 @@ while [[ $# -gt 0 ]]; do
         --spatial-max-distance)  SPATIAL_MAX_DISTANCE="$2";  shift 2 ;;
         --disambiguate)          DISAMBIGUATE="$2";          shift 2 ;;
         --dg-threshold)          DG_THRESHOLD="$2";          shift 2 ;;
+        --init-from)             INIT_FROM="$2";             shift 2 ;;
+        --normalize-exposure)    NORMALIZE_EXPOSURE=1;       shift ;;
         --hloc-retrieval-k)      HLOC_RETRIEVAL_K="$2";      shift 2 ;;
         --colmap-bin)       COLMAP_BIN="$2";     shift 2 ;;
         --camera-model)     CAMERA_MODEL="$2"; shift 2 ;;
@@ -311,6 +315,13 @@ case "$TRAINER" in
 esac
 
 # Spirula trains from a COLMAP model, like Brush's COLMAP loader, so only those SfM paths can feed it.
+[[ "$NORMALIZE_EXPOSURE" == "1" && "$TRAINER" != "brush" ]] && { echo "Error: --normalize-exposure is wired into --trainer brush only"; exit 1; }
+if [[ -n "$INIT_FROM" ]]; then
+    [[ "$TRAINER" == "brush" && "$SFM" == "preposed_colmap" ]] || { echo "Error: --init-from needs --trainer brush --sfm preposed_colmap"; exit 1; }
+    # Resolved at run time, so a job can be queued behind the one it starts from.
+    INIT_PLY=$(ls "$INIT_FROM"/brush_output/export_*.ply 2>/dev/null | sort -V | tail -1)
+    [[ -n "$INIT_PLY" ]] || { echo "Error: --init-from $INIT_FROM has no brush_output/export_*.ply"; exit 1; }
+fi
 if [[ -n "$DISAMBIGUATE" ]]; then
     [[ "$SFM" == "glomap_sift" ]] || { echo "Error: --disambiguate is wired into --sfm glomap_sift only, not $SFM"; exit 1; }
     for _d in ${DISAMBIGUATE//,/ }; do
@@ -1811,6 +1822,25 @@ elif [[ "$TRAINER" == "brush" ]]; then
     # coordinate-corrected COLMAP sparse and loads the original PLY instead)
     _BRUSH_SCENE="$SCENE_DIR"
     [[ "$SFM" == "preposed" || "$SFM" == "preposed_colmap" ]] && _BRUSH_SCENE="$MODEL_DIR"
+    # Phone captures without exposure lock drift ~1.25 stops between photos (ISO 400-1250, auto WB); Brush has no
+    # per-photo appearance model and bakes the drift in as haze. Train on normalised COPIES (same poses): U2
+    # 2026-10-09 +0.6..1.3 dB gain-matched PSNR, detail +1-2 pp, visibly cleaner.
+    if [[ "$NORMALIZE_EXPOSURE" == "1" ]]; then
+        # Brush tries its COLMAP loader before transforms.json, so a COLMAP scene here is what it trains on anyway.
+        [[ -f "$_BRUSH_SCENE/sparse/0/images.bin" ]] || \
+            { echo "Error: --normalize-exposure needs a COLMAP scene (images/ + sparse/0) at $_BRUSH_SCENE"; exit 1; }
+        echo "    Normalising exposure/WB per photo..."
+        rm -rf "$MODEL_DIR/expnorm"
+        "$PYTHON" "$REPO/normalize_exposure.py" "$_BRUSH_SCENE" "$MODEL_DIR/expnorm" 2>&1 | tee "$MODEL_DIR/01e_normalize_exposure.log"
+        [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "Error: normalize_exposure.py failed. Check $MODEL_DIR/01e_normalize_exposure.log"; exit 1; }
+        _BRUSH_SCENE="$MODEL_DIR/expnorm"
+    fi
+    # Brush seeds from init.ply in the scene dir when there is one (full splats, not just points): a partial
+    # update starts from the previous model and trains only on the new photos.
+    if [[ -n "$INIT_FROM" ]]; then
+        ln -sfn "$(realpath "$INIT_PLY")" "$_BRUSH_SCENE/init.ply"
+        echo "    Init splats: $INIT_PLY"
+    fi
     echo "[2/3] Brush training ($ITERS iterations, $TOTAL_FRAMES frames)..."
     # BRUSH_EXTRA_ARGS: space-separated additional flags passed through --brush-extra-args
     _BRUSH_EXTRA=()
