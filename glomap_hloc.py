@@ -116,6 +116,11 @@ def main():
     ap.add_argument("--matcher", default="aliked+lightglue", choices=ALL_MATCHERS)
     ap.add_argument("--mapper", default="glomap", choices=["glomap", "colmap"],
                     help="glomap=global mapper (default), colmap=incremental mapper")
+    ap.add_argument("--camera-model", default="PINHOLE",
+                    help="COLMAP camera model of --camera-params (the pipeline passes its own, e.g. OPENCV)")
+    ap.add_argument("--camera-params", default=None,
+                    help="Known intrinsics as COLMAP params for --camera-model (e.g. fx,fy,cx,cy[,k1,k2,p1,p2]); "
+                         "wins over --focal-length, so SfM starts from the real camera instead of a guess")
     ap.add_argument("--focal-length", type=float, default=None,
                     help="Prior focal length in pixels (fixes GLOMAP 'no prior' warning)")
     ap.add_argument("--colmap-bin", default=None,
@@ -211,7 +216,10 @@ def main():
     # Prior is stored as camera params: for SIMPLE_PINHOLE model, params = [f, cx, cy].
     # We use PINHOLE (f, f, cx, cy) so both fx and fy are set.
     img_opts = {}
-    if args.focal_length:
+    if args.camera_params:
+        img_opts = {"camera_model": args.camera_model, "camera_params": args.camera_params}
+        print(f"[hloc] Using known camera: {args.camera_model} {args.camera_params}", flush=True)
+    elif args.focal_length:
         # Sample one image to get image dimensions
         sample = next(image_dir.iterdir())
         try:

@@ -392,6 +392,13 @@ _CAM_PARAMS_ARG=()
 if [[ -n "$CAMERA_PARAMS" ]]; then
     _CAM_PARAMS_ARG=(--ImageReader.camera_params "$CAMERA_PARAMS")
 fi
+# The same known camera for the learned-feature (hloc) paths. Without it glomap_hloc.py let COLMAP guess
+# one: on sim pod 58a2b462 (ALIKED) f=1453 vs 1470 and a centred principal point 29 px off the true one,
+# and the splat trained on that wrong camera (19.7 dB where SIFT gets 25.6).
+_HLOC_CAM_ARG=()
+if [[ -n "$CAMERA_PARAMS" ]]; then
+    _HLOC_CAM_ARG=(--camera-model "$CAMERA_MODEL" --camera-params "$CAMERA_PARAMS")
+fi
 
 # gsplat pose/appearance optimisation args, built once for both strategy branches.
 # Empty unless requested, so the default path is byte-identical to before.
@@ -670,6 +677,14 @@ emit_event "{\"event\":\"frames_extracted\",\"total_frames\":$TOTAL_FRAMES}"
 # Swap the scene to undistorted: PINHOLE sparse/0 + undistorted images, so every trainer sees a plain
 # PINHOLE scene. The pod keeps this PINHOLE model but the DISTORTED upload in images/ -- a pair that
 # does not match (fork-training 44668193 trained on exactly that mismatch, -1.5 dB).
+# The hloc paths (glomap_hloc.py, glomap_dedode.py) end with whatever camera SfM settled on: OPENCV when the
+# known intrinsics were passed, SIMPLE_RADIAL when COLMAP guessed. Undistort it as the SIFT paths do, so
+# Brush gets a PINHOLE scene (58a2b462 trained on an unconverted SIMPLE_RADIAL model).
+hloc_to_pinhole() {
+    local _m
+    _m=$("$PYTHON" -c "import pycolmap, sys; r = pycolmap.Reconstruction(sys.argv[1]); print(r.cameras[next(iter(r.images.values())).camera_id].model.name)" "$SPARSE_PARENT/0")
+    if [[ -n "$_m" && "$_m" != "PINHOLE" ]]; then undistort_to_pinhole "$_m" keep; fi
+}
 undistort_to_pinhole() {
     echo "    Undistorting images ($1 → PINHOLE)..."
     # $2 = keep: save the DISTORTED model in the pod, because it is the one that pairs with the pod's
@@ -1074,6 +1089,7 @@ elif [[ "$SFM" == "glomap_aliked" ]]; then
         --pairs "$_HLOC_PAIRS" \
         --retrieval-k "$HLOC_RETRIEVAL_K" \
         --colmap-bin "$COLMAP_BIN" \
+        "${_HLOC_CAM_ARG[@]}" \
         2>&1 | tee "$MODEL_DIR/01_glomap_aliked.log"
 
     if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
@@ -1085,6 +1101,7 @@ elif [[ "$SFM" == "glomap_aliked" ]]; then
 
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_aliked_filter.log"
+    hloc_to_pinhole
 
 elif [[ "$SFM" == "glomap_loftr" ]]; then
     echo "[2/3] LoFTR semi-dense matching + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
@@ -1112,6 +1129,7 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
         --pairs "$_HLOC_PAIRS" \
         --retrieval-k "$HLOC_RETRIEVAL_K" \
         --colmap-bin "$COLMAP_BIN" \
+        "${_HLOC_CAM_ARG[@]}" \
         2>&1 | tee "$MODEL_DIR/01_glomap_loftr.log"
 
     if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
@@ -1123,6 +1141,7 @@ elif [[ "$SFM" == "glomap_loftr" ]]; then
 
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_loftr_filter.log"
+    hloc_to_pinhole
 
 elif [[ "$SFM" == "glomap_dedode" ]]; then
     echo "[2/3] DeDoDe detect+describe + GLOMAP global SfM ($TOTAL_FRAMES frames)..."
@@ -1156,6 +1175,7 @@ elif [[ "$SFM" == "glomap_dedode" ]]; then
 
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_glomap_dedode_filter.log"
+    hloc_to_pinhole
 
 elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "colmap_aliked" ]]; then
     case "$SFM" in
@@ -1194,6 +1214,7 @@ elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "c
         --retrieval-k "$HLOC_RETRIEVAL_K" \
         $_FL_ARG \
         --colmap-bin "$COLMAP_BIN" \
+        "${_HLOC_CAM_ARG[@]}" \
         2>&1 | tee "$MODEL_DIR/01_${SFM}.log"
 
     if [[ ! -d "$HLOC_WORK/sparse/0" ]]; then
@@ -1205,6 +1226,7 @@ elif [[ "$SFM" == "glomap_disk" || "$SFM" == "glomap_superpoint" || "$SFM" == "c
 
     SPARSE_PATH="$SPARSE_PARENT/0" IMAGE_DIR_PATH="$IMAGE_DIR" \
         "$PYTHON" "$REPO/filter_sfm_outliers.py" 2>&1 | tee "$MODEL_DIR/01b_${SFM}_filter.log"
+    hloc_to_pinhole
 
 elif [[ "$SFM" == "fastmap" ]]; then
     echo "[2/3] COLMAP features + matching + FastMap pose estimation ($TOTAL_FRAMES frames)..."
