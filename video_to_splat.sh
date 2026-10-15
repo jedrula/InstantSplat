@@ -1964,7 +1964,24 @@ elif [[ "$TRAINER" == "spirula" ]]; then
     # Spirula too. Appended last, so they override the defaults above (e.g. --use-bilateral-grid 0).
     _SP_EXTRA=()
     [[ -n "${BRUSH_EXTRA_ARGS:-}" ]] && read -ra _SP_EXTRA <<< "$BRUSH_EXTRA_ARGS"
-    echo "    Spirula extra flags: ${_SP_EXTRA[*]:-(none)}"
+    # --precompute-geometry normals|depth (ours, not Spirula's; 2026-10-15): run `spirula geometry` (MoGe) on the
+    # images Spirula is about to train on - undistorted, so the maps line up - writing normals/ (and depths/ for
+    # `depth`) into the dataset, where training reads them by name. Weights: --normal-supervision-weight (default
+    # 0.01) / --depth-supervision-weight (default 0, so pass it) in the same extra flags.
+    _SP_GEOM=""; _SP_KEEP=()
+    for ((i = 0; i < ${#_SP_EXTRA[@]}; i++)); do
+        if [[ "${_SP_EXTRA[i]}" == "--precompute-geometry" ]]; then _SP_GEOM="${_SP_EXTRA[i+1]:-normals}"; i=$((i + 1))
+        else _SP_KEEP+=("${_SP_EXTRA[i]}"); fi
+    done
+    _SP_EXTRA=("${_SP_KEEP[@]}")
+    if [[ -n "$_SP_GEOM" ]]; then
+        [[ "$_SP_GEOM" == normals || "$_SP_GEOM" == depth ]] || { echo "Error: --precompute-geometry takes normals or depth, not $_SP_GEOM"; exit 1; }
+        echo "[1.9/3] spirula geometry ($_SP_GEOM) on $_SP_SCENE/images..."
+        _SP_GEOM_ARGS=(); [[ "$_SP_GEOM" == depth ]] && _SP_GEOM_ARGS=(--depth)
+        "$SPIRULA_BIN" geometry "$_SP_SCENE" "${_SP_GEOM_ARGS[@]}" 2>&1 | tee "$MODEL_DIR/01e_geometry.log"
+        [[ -d "$_SP_SCENE/normals" ]] || { echo "Error: spirula geometry wrote no normals/ (see $MODEL_DIR/01e_geometry.log)"; exit 1; }
+    fi
+    echo "    Spirula extra flags: ${_SP_EXTRA[*]:-(none)}${_SP_GEOM:+ | geometry: $_SP_GEOM}"
     echo "[2/3] Spirula training ($ITERS iterations, $TOTAL_FRAMES frames, ${_SP_MAXSIDE}px)..."
     "$SPIRULA_BIN" train 3dgs --data "$_SP_SCENE" \
         --data-format colmap --colmap-recon-dir sparse/0 \
