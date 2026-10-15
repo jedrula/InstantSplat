@@ -1979,8 +1979,12 @@ elif [[ "$TRAINER" == "spirula" ]]; then
         [[ "$_SP_GEOM" == normals || "$_SP_GEOM" == depth ]] || { echo "Error: --precompute-geometry takes normals or depth, not $_SP_GEOM"; exit 1; }
         echo "[1.9/3] spirula geometry ($_SP_GEOM) on $_SP_SCENE/images..."
         _SP_GEOM_ARGS=(); [[ "$_SP_GEOM" == depth ]] && _SP_GEOM_ARGS=(--depth)
-        "$SPIRULA_BIN" geometry "$_SP_SCENE" "${_SP_GEOM_ARGS[@]}" 2>&1 | tee "$MODEL_DIR/01e_geometry.log"
-        [[ -d "$_SP_SCENE/normals" ]] || { echo "Error: spirula geometry wrote no normals/ (see $MODEL_DIR/01e_geometry.log)"; exit 1; }
+        # Spirula 2026.9.30's geometry segfaults on exit AFTER writing every map (2026-10-15: "done: 136 written",
+        # then exit 139), so judge it by its output - one normal map per training image - not by its exit code.
+        "$SPIRULA_BIN" geometry "$_SP_SCENE" "${_SP_GEOM_ARGS[@]}" 2>&1 | tee "$MODEL_DIR/01e_geometry.log" || true
+        _SP_NI=$(ls "$_SP_SCENE/images" | wc -l); _SP_NN=$(ls "$_SP_SCENE/normals" 2>/dev/null | wc -l)
+        (( _SP_NN >= _SP_NI )) || { echo "Error: spirula geometry wrote $_SP_NN of $_SP_NI normal maps (see $MODEL_DIR/01e_geometry.log)"; exit 1; }
+        echo "    geometry: $_SP_NN normal maps for $_SP_NI images"
     fi
     echo "    Spirula extra flags: ${_SP_EXTRA[*]:-(none)}${_SP_GEOM:+ | geometry: $_SP_GEOM}"
     echo "[2/3] Spirula training ($ITERS iterations, $TOTAL_FRAMES frames, ${_SP_MAXSIDE}px)..."
