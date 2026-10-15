@@ -87,7 +87,7 @@ SMART_FPS=5.0
 SPARSE_PAIRS=0
 SPARSE_GA=0
 SFM="mast3r"       # mast3r | fast3r | pose_prior | spirula | colmap_sift | glomap_sift | glomap_loma | glomap_aliked | glomap_disk | glomap_superpoint | glomap_loftr | glomap_dedode | colmap_aliked | fastmap | realityscan | onthefly
-TRAINER="instantsplat"  # instantsplat | splatfacto | gsplat | 2dgs | brush | spirula | onthefly
+TRAINER="instantsplat"  # instantsplat | splatfacto | gsplat | 2dgs | brush | spirula | lichtfeld | onthefly
 LANGSPLAT=0         # 1 = run LangSplat pipeline after training
 LANGSPLAT_ITERS=3000
 LANGSPLAT_AE_EPOCHS=30
@@ -310,8 +310,8 @@ is_colmap_sfm() { [[ "$COLMAP_SFMS" == *" $SFM "* ]]; }
 # The training if/elif chain ends in a bare `else` = instantsplat, so an unknown trainer
 # would silently train instantsplat. Reject it here instead.
 case "$TRAINER" in
-    instantsplat|splatfacto|gsplat|2dgs|brush|spirula|onthefly) ;;
-    *) echo "Error: unknown --trainer '$TRAINER' (instantsplat|splatfacto|gsplat|2dgs|brush|spirula|onthefly)"; exit 1 ;;
+    instantsplat|splatfacto|gsplat|2dgs|brush|spirula|lichtfeld|onthefly) ;;
+    *) echo "Error: unknown --trainer '$TRAINER' (instantsplat|splatfacto|gsplat|2dgs|brush|spirula|lichtfeld|onthefly)"; exit 1 ;;
 esac
 
 # Spirula trains from a COLMAP model, like Brush's COLMAP loader, so only those SfM paths can feed it.
@@ -332,10 +332,11 @@ if [[ -n "$DISAMBIGUATE" ]]; then
         esac
     done
 fi
-if [[ "$TRAINER" == "spirula" ]] && ! is_colmap_sfm && [[ "$SFM" != "preposed_colmap" && "$SFM" != "pose_prior" ]]; then
-    echo "Error: --trainer spirula needs a COLMAP model (--sfm $COLMAP_SFMS preposed_colmap pose_prior), not --sfm $SFM"; exit 1
+if [[ "$TRAINER" == "spirula" || "$TRAINER" == "lichtfeld" ]] && ! is_colmap_sfm && [[ "$SFM" != "preposed_colmap" && "$SFM" != "pose_prior" ]]; then
+    echo "Error: --trainer $TRAINER needs a COLMAP model (--sfm $COLMAP_SFMS preposed_colmap pose_prior), not --sfm $SFM"; exit 1
 fi
 SPIRULA_BIN="${SPIRULA_BIN:-/home/communications/workdir/spirula-studio/spirula}"
+LICHTFELD_BIN="${LICHTFELD_BIN:-/home/communications/workdir/LichtFeld-Studio-054/build/LichtFeld-Studio}"
 
 # SfM feature-extraction cap: must be a positive integer, since it is spliced
 # straight into the COLMAP command line at three call sites.
@@ -443,8 +444,8 @@ if [[ "$SFM" == "preposed" ]]; then
     [[ ! -d "$PREPOSED_DIR/images" ]] && { echo "Error: $PREPOSED_DIR/images not found"; exit 1; }
     SKIP_EXTRACTION=1
     case "$TRAINER" in
-        brush|spirula|gsplat|2dgs|splatfacto) ;;
-        *) echo "Error: --sfm preposed does not support --trainer $TRAINER (supported: brush, spirula, gsplat, 2dgs, splatfacto)"; exit 1 ;;
+        brush|spirula|lichtfeld|gsplat|2dgs|splatfacto) ;;
+        *) echo "Error: --sfm preposed does not support --trainer $TRAINER (supported: brush, spirula, lichtfeld, gsplat, 2dgs, splatfacto)"; exit 1 ;;
     esac
 fi
 # --sfm pose_prior: seed COLMAP's mapper with the phone's ARKit poses instead of letting it
@@ -461,8 +462,8 @@ if [[ "$SFM" == "pose_prior" ]]; then
         [[ -e "$ARKIT_DIR/$_f" ]] || { echo "Error: $ARKIT_DIR/$_f not found"; exit 1; }
     done
     case "$TRAINER" in
-        brush|spirula|gsplat|2dgs|splatfacto) ;;
-        *) echo "Error: --sfm pose_prior does not support --trainer $TRAINER (supported: brush, spirula, gsplat, 2dgs, splatfacto)"; exit 1 ;;
+        brush|spirula|lichtfeld|gsplat|2dgs|splatfacto) ;;
+        *) echo "Error: --sfm pose_prior does not support --trainer $TRAINER (supported: brush, spirula, lichtfeld, gsplat, 2dgs, splatfacto)"; exit 1 ;;
     esac
     # COLMAP 4.x only: 3.9.1 has no pose_prior_mapper and its SIFT descriptors are
     # incompatible with 4.x, so the whole chain must stay on one generation.
@@ -498,8 +499,8 @@ if [[ "$SFM" == "preposed_colmap" ]]; then
     [[ ! -d "$PREPOSED_DIR/images" ]] && { echo "Error: $PREPOSED_DIR/images not found"; exit 1; }
     SKIP_EXTRACTION=1
     case "$TRAINER" in
-        brush|spirula|gsplat|2dgs|splatfacto) ;;
-        *) echo "Error: --sfm preposed_colmap does not support --trainer $TRAINER (supported: brush, spirula, gsplat, 2dgs, splatfacto)"; exit 1 ;;
+        brush|spirula|lichtfeld|gsplat|2dgs|splatfacto) ;;
+        *) echo "Error: --sfm preposed_colmap does not support --trainer $TRAINER (supported: brush, spirula, lichtfeld, gsplat, 2dgs, splatfacto)"; exit 1 ;;
     esac
 fi
 
@@ -1998,6 +1999,30 @@ elif [[ "$TRAINER" == "spirula" ]]; then
     "$PYTHON" -c "import json,sys;t=json.load(open(sys.argv[1]))['world_from_train']['matrix_4x4'];sys.exit(t!=[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]])" "$SPIRULA_OUT/scene_transform.json" \
         || { echo "Error: Spirula trained in a non-identity frame ($SPIRULA_OUT/scene_transform.json)"; exit 1; }
     SPARSE_PARENT="$SCENE_DIR/sparse"
+elif [[ "$TRAINER" == "lichtfeld" ]]; then
+    # LichtFeld Studio v0.5.4 (2026-10-15), headless. Default strategy igs+ (ImprovedGS+ densification: splats where
+    # edges and contrast are) capped at 1M like our Spirula runs; same every-8th held-out split. Its own flags
+    # (--strategy, --max-cap, --ppisp, --bilateral-grid, --use-normal-loss ...) come through the extra-flags field and
+    # override these defaults. LichtFeld caps width itself (--max-width), so no resolution refusal as for Spirula.
+    [[ -x "$LICHTFELD_BIN" ]] || { echo "Error: LichtFeld not built at $LICHTFELD_BIN"; exit 1; }
+    _LF_SCENE="$SCENE_DIR"
+    [[ "$SFM" == "preposed_colmap" ]] && _LF_SCENE="$MODEL_DIR"
+    LF_OUT="$MODEL_DIR/lichtfeld_output"
+    rm -rf "$LF_OUT"
+    _LF_EXTRA=()
+    [[ -n "${BRUSH_EXTRA_ARGS:-}" ]] && read -ra _LF_EXTRA <<< "$BRUSH_EXTRA_ARGS"
+    _LF_DEF=(--strategy igs+ --max-cap 1000000)
+    for f in "${_LF_EXTRA[@]}"; do [[ "$f" == --strategy || "$f" == --max-cap ]] && _LF_DEF=(); done
+    echo "    LichtFeld flags: ${_LF_DEF[*]} ${_LF_EXTRA[*]:-}"
+    echo "[2/3] LichtFeld training ($ITERS iterations, $TOTAL_FRAMES frames, max width $TRAIN_MAX_IMAGE_SIZE)..."
+    "$LICHTFELD_BIN" --headless -d "$_LF_SCENE" -o "$LF_OUT" -i "$ITERS" \
+        --max-width "$TRAIN_MAX_IMAGE_SIZE" --eval --test-every 8 --export ply \
+        "${_LF_DEF[@]}" "${_LF_EXTRA[@]}" \
+        2>&1 | tee "$MODEL_DIR/02_train.log"
+    _LF_PLY=$(find "$LF_OUT" -name "*.ply" -newer "$MODEL_DIR/02_train.log" 2>/dev/null | sort | tail -1)
+    [[ -z "$_LF_PLY" ]] && _LF_PLY=$(find "$LF_OUT" -name "*.ply" 2>/dev/null | sort | tail -1)
+    [[ -n "$_LF_PLY" ]] || { echo "Error: LichtFeld exported no .ply into $LF_OUT"; exit 1; }
+    SPARSE_PARENT="$SCENE_DIR/sparse"
 else
     # instantsplat trainer
     # train.py looks for sparse_{N}/0/ — COLMAP/GLOMAP/FastMap write sparse/0/ instead;
@@ -2062,6 +2087,9 @@ elif [[ "$TRAINER" == "brush" ]]; then
     ACTUAL_ITER=$ITERS
 elif [[ "$TRAINER" == "spirula" ]]; then
     PLY="$MODEL_DIR/spirula_output/step-$(printf %09d "$ITERS").ckpt/splat.ply"
+    ACTUAL_ITER=$ITERS
+elif [[ "$TRAINER" == "lichtfeld" ]]; then
+    PLY=$(find "$MODEL_DIR/lichtfeld_output" -name "*.ply" 2>/dev/null | sort | tail -1)
     ACTUAL_ITER=$ITERS
 elif [[ "$TRAINER" == "splatfacto" ]]; then
     NS_CONFIG=$(find "$MODEL_DIR/ns_train" -name "config.yml" 2>/dev/null | sort | tail -1)
