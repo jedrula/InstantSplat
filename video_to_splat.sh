@@ -288,6 +288,9 @@ while [[ $# -gt 0 ]]; do
         --model-dir)    MODEL_DIR_OVERRIDE="$2"; shift 2 ;;
         --preposed-dir) PREPOSED_DIR="$2";      shift 2 ;;
         --no-sog)       NO_SOG=1;               shift 1 ;;
+        --sog-sh)       SOG_SH="$2";            shift 2 ;;
+        --no-splat)     NO_SPLAT=1;             shift 1 ;;
+        --preview-every) PREVIEW_EVERY="$2";    shift 2 ;;
         --fps-list)     FPS_LIST="$2";     shift 2 ;;
         --nframes-list) NFRAMES_LIST="$2"; shift 2 ;;
         --start-list)   START_LIST="$2";   shift 2 ;;
@@ -1969,9 +1972,14 @@ elif [[ "$TRAINER" == "spirula" ]]; then
     # images Spirula is about to train on - undistorted, so the maps line up - writing normals/ (and depths/ for
     # `depth`) into the dataset, where training reads them by name. Weights: --normal-supervision-weight (default
     # 0.01) / --depth-supervision-weight (default 0, so pass it) in the same extra flags.
-    _SP_GEOM=""; _SP_KEEP=()
+    # --depth-maps DIR (ours, 2026-10-16): measured depth (the phone's LiDAR: lidar_depth_to_png.py) as <stem>.png
+    # 16-bit mm; copied into the training set's depths/ at each training image's size, where Spirula's depth term
+    # reads it (weight: --depth-supervision-weight in the same extra flags).
+    _SP_GEOM=""; _SP_KEEP=(); _SP_DEPTHS=""; _SP_NORMALS=""
     for ((i = 0; i < ${#_SP_EXTRA[@]}; i++)); do
         if [[ "${_SP_EXTRA[i]}" == "--precompute-geometry" ]]; then _SP_GEOM="${_SP_EXTRA[i+1]:-normals}"; i=$((i + 1))
+        elif [[ "${_SP_EXTRA[i]}" == "--depth-maps" ]]; then _SP_DEPTHS="${_SP_EXTRA[i+1]}"; i=$((i + 1))
+        elif [[ "${_SP_EXTRA[i]}" == "--normal-maps" ]]; then _SP_NORMALS="${_SP_EXTRA[i+1]}"; i=$((i + 1))
         else _SP_KEEP+=("${_SP_EXTRA[i]}"); fi
     done
     _SP_EXTRA=("${_SP_KEEP[@]}")
@@ -1986,8 +1994,34 @@ elif [[ "$TRAINER" == "spirula" ]]; then
         (( _SP_NN >= _SP_NI )) || { echo "Error: spirula geometry wrote $_SP_NN of $_SP_NI normal maps (see $MODEL_DIR/01e_geometry.log)"; exit 1; }
         echo "    geometry: $_SP_NN normal maps for $_SP_NI images"
     fi
+    # --normal-maps DIR (ours): measured normals (lidar_normals_to_png.py) into normals/, the same way.
+    for _SP_PAIR in "depths:$_SP_DEPTHS" "normals:$_SP_NORMALS"; do
+    _SP_KIND=${_SP_PAIR%%:*}; _SP_SRC=${_SP_PAIR#*:}
+    if [[ -n "$_SP_SRC" ]]; then
+        mkdir -p "$_SP_SCENE/$_SP_KIND"
+        ~/miniconda3/envs/opencv_env/bin/python - "$_SP_SRC" "$_SP_SCENE/images" "$_SP_SCENE/$_SP_KIND" <<'PYD'
+import sys, os, glob, cv2
+src, imgs, out = sys.argv[1:4]; n = 0
+for p in sorted(glob.glob(os.path.join(imgs, "*"))):
+    stem = os.path.splitext(os.path.basename(p))[0]; d = os.path.join(src, stem + ".png")
+    if not os.path.exists(d): continue
+    h, w = cv2.imread(p, cv2.IMREAD_UNCHANGED).shape[:2]
+    cv2.imwrite(os.path.join(out, stem + ".png"), cv2.resize(cv2.imread(d, cv2.IMREAD_UNCHANGED), (w, h), interpolation=cv2.INTER_NEAREST)); n += 1
+print(f"    {os.path.basename(out)} maps: {n} from {src}")
+PYD
+    fi
+    done
     echo "    Spirula extra flags: ${_SP_EXTRA[*]:-(none)}${_SP_GEOM:+ | geometry: $_SP_GEOM}"
     echo "[2/3] Spirula training ($ITERS iterations, $TOTAL_FRAMES frames, ${_SP_MAXSIDE}px)..."
+    # --preview-every N: a checkpoint every N steps, each turned into a small preview .sog in $MODEL_DIR/preview
+    # (preview_watch.sh) for the phone to show while training runs (2026-10-28). Costs ~1 s of writing per save.
+    _SP_PREVIEW=(); _PW=""
+    if [[ -n "${PREVIEW_EVERY:-}" ]]; then
+        _SP_PREVIEW=(--steps-per-save "$PREVIEW_EVERY")
+        rm -rf "$MODEL_DIR/preview"
+        bash "$HOME/workdir/InstantSplat/preview_watch.sh" "$SPIRULA_OUT" "$MODEL_DIR/preview" "$ITERS" $$ &
+        _PW=$!
+    fi
     "$SPIRULA_BIN" train 3dgs --data "$_SP_SCENE" \
         --data-format colmap --colmap-recon-dir sparse/0 \
         --num-iterations "$ITERS" --eval-mode interval --eval-interval 8 \
@@ -1995,8 +2029,9 @@ elif [[ "$TRAINER" == "spirula" ]]; then
         --use-bilateral-grid 0 --use-ppisp 0 \
         --disable-viewer 1 --keep-viewer-alive 0 \
         --output-dir-prefix "$MODEL_DIR" --output-dir-name spirula_output \
-        "${_SP_EXTRA[@]}" \
+        "${_SP_PREVIEW[@]}" "${_SP_EXTRA[@]}" \
         2>&1 | tee "$MODEL_DIR/02_train.log"
+    [[ -n $_PW ]] && kill "$_PW" 2>/dev/null
     [[ -f "$SPIRULA_OUT/step-$(printf %09d "$ITERS").ckpt/splat.ply" ]] || { echo "Error: Spirula wrote no splat.ply for iter $ITERS in $SPIRULA_OUT"; exit 1; }
     # --scene-center none keeps the splats in the SfM's world frame; prove it, since every viewer and
     # /carpet read the PLY in that frame.
@@ -2115,12 +2150,18 @@ SPLAT_OUT="$MODEL_DIR/${SCENE}_f${TOTAL_FRAMES}_i${ACTUAL_ITER}.splat"
 
 # ── Step 3: PLY → .splat ─────────────────────────────────────────────────────
 echo ""
-echo "[3/3] Converting to .splat..."
-PLY2SPLAT_START=$(date +%s)
-"$PYTHON" "$REPO/ply2splat.py" "$PLY" "$SPLAT_OUT"
-PLY2SPLAT_ELAPSED=$(( $(date +%s) - PLY2SPLAT_START ))
-SPLAT_SIZE=$(stat -c%s "$SPLAT_OUT" 2>/dev/null || echo 0)
-emit_event "{\"event\":\"splat_ready\",\"filename\":\"$(basename $SPLAT_OUT)\",\"size_bytes\":$SPLAT_SIZE,\"ply2splat_s\":$PLY2SPLAT_ELAPSED}"
+# --no-splat: the trained .ply is the product; the server converts a .splat on first request (GET /splat).
+if [[ "${NO_SPLAT:-}" == "1" ]]; then
+    echo "[3/3] skipping .splat (--no-splat): /splat converts on demand"
+    SPLAT_OUT=""
+else
+    echo "[3/3] Converting to .splat..."
+    PLY2SPLAT_START=$(date +%s)
+    "$PYTHON" "$REPO/ply2splat.py" "$PLY" "$SPLAT_OUT"
+    PLY2SPLAT_ELAPSED=$(( $(date +%s) - PLY2SPLAT_START ))
+    SPLAT_SIZE=$(stat -c%s "$SPLAT_OUT" 2>/dev/null || echo 0)
+    emit_event "{\"event\":\"splat_ready\",\"filename\":\"$(basename $SPLAT_OUT)\",\"size_bytes\":$SPLAT_SIZE,\"ply2splat_s\":$PLY2SPLAT_ELAPSED}"
+fi
 
 # ── Step 3b: PLY → .sog (web delivery) ───────────────────────────────────────
 # The web viewers download this instead of the raw PLY: measured 149.4 MB -> 10.9 MB
@@ -2136,6 +2177,9 @@ emit_event "{\"event\":\"splat_ready\",\"filename\":\"$(basename $SPLAT_OUT)\",\
 # it does not hide a training problem.
 SOG_OUT="${PLY%.ply}.sog"
 SPLAT_TRANSFORM_BIN="${SPLAT_TRANSFORM_BIN:-/home/communications/.nvm/versions/node/v22.22.2/bin/splat-transform}"
+# --sog-sh N: the .sog keeps view-dependent colour up to degree N (0 = flat colour: 4-6 s instead of ~25-80 s,
+# for the quick first look, 2026-10-27). splat-transform applies -H to the file named before it.
+_SOG_ACT=(); [[ -n "${SOG_SH:-}" ]] && _SOG_ACT=(-H "$SOG_SH")
 if [[ "$NO_SOG" == "1" ]]; then
     # Measured 131 s of a 7.3 min job on 1.23M splats -- 30% of the run for a
     # WEB DELIVERY artefact an experiment never opens. Skipped explicitly rather
@@ -2143,9 +2187,9 @@ if [[ "$NO_SOG" == "1" ]]; then
     # "not found" and read like a broken install.
     echo "[3b/3] skipping .sog (--no-sog): experiment run, /sog converts on demand"
 elif [[ -x "$SPLAT_TRANSFORM_BIN" ]]; then
-    echo "[3b/3] Converting to .sog for web delivery..."
+    echo "[3b/3] Converting to .sog for web delivery${SOG_SH:+ (colour degree $SOG_SH)}..."
     SOG_START=$(date +%s)
-    if "$SPLAT_TRANSFORM_BIN" "$PLY" "$SOG_OUT" >/dev/null 2>&1; then
+    if "$SPLAT_TRANSFORM_BIN" "$PLY" "${_SOG_ACT[@]}" "$SOG_OUT" >/dev/null 2>&1; then
         SOG_ELAPSED=$(( $(date +%s) - SOG_START ))
         SOG_SIZE=$(stat -c%s "$SOG_OUT" 2>/dev/null || echo 0)
         echo "        $(numfmt --to=iec $SOG_SIZE 2>/dev/null || echo $SOG_SIZE) in ${SOG_ELAPSED}s"
@@ -2210,7 +2254,7 @@ fi
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  Done! $(date '+%Y-%m-%d %H:%M:%S')  (${ELAPSED_MIN} min)"
 echo "╠══════════════════════════════════════════════════════╣"
-echo "║  $SPLAT_OUT"
+echo "║  ${SPLAT_OUT:-$PLY}"
 echo "╠══════════════════════════════════════════════════════╣"
 echo "║  Drag onto https://antimatter15.com/splat/ to view"
 echo "╚══════════════════════════════════════════════════════╝"
