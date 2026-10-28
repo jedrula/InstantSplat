@@ -2,14 +2,18 @@
 # preview_watch.sh <spirula output dir> <preview dir> <final step> <trainer pid>: while Spirula trains, turn each
 # checkpoint it saves (--steps-per-save) into a small preview .sog the phone can show as it comes (2026-10-28, Andrzej:
 # "stream reconstruction from the training at say every 1k iters ... show it on the phone to keep people engaged").
-# A preview is flat colour (-H 0) and at most PREVIEW_MAX splats (thinned uniformly), ~2-3 MB, made on the CPU so the
-# training GPU is untouched. <preview dir>/preview.json names the newest: {"step", "of", "splats", "file", "at"};
+# A preview is the checkpoint in flat colour (-H 0): ~3 s on the CPU so the training GPU is untouched, ~13 MB at 1M
+# splats - never more than the final .sog the phone loads anyway. No thinning by default (PREVIEW_MAX=0): splat-transform
+# -d took 60 s on the CPU (previews a minute late, steps skipped, training stalled up to 12 s while it ran) and keeping a
+# subset instead (opacity, footprint, random) lost 13-27 dB against the full splat (2026-10-28, run 7919560e). <preview dir>/preview.json names the newest: {"step", "of", "splats", "file", "at"};
 # only the newest .sog is kept. The final step is not previewed: the job's own .sog follows it.
 set -uo pipefail
 OUT=$1; PV=$2; LAST=$3; PID=$4
 ST=${PREVIEW_ST:-$HOME/tools/st3103/node_modules/.bin/splat-transform}
-MAX=${PREVIEW_MAX:-250000}
+MAX=${PREVIEW_MAX:-0}
 mkdir -p "$PV"
+# Training ends with a kill: don't leave the 250 MB checkpoint copy behind.
+trap 'rm -f "$PV/in.ply" "$PV/thin.ply"; exit 0' TERM INT
 done_step=0
 while kill -0 "$PID" 2>/dev/null; do
     sleep 2
@@ -25,7 +29,7 @@ while kill -0 "$PID" 2>/dev/null; do
     cp "$ply" "$PV/in.ply" 2>/dev/null || continue
     n=$(head -c 4096 "$PV/in.ply" | grep -a -m1 "^element vertex" | awk '{print $3}')
     src="$PV/in.ply"
-    if (( ${n:-0} > MAX )); then
+    if (( MAX > 0 && ${n:-0} > MAX )); then
         "$ST" -q -w -g cpu "$PV/in.ply" -H 0 -d "$MAX" "$PV/thin.ply" >/dev/null 2>&1 || { done_step=$step; continue; }
         src="$PV/thin.ply"; n=$MAX
     fi

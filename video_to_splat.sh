@@ -2013,8 +2013,8 @@ PYD
     done
     echo "    Spirula extra flags: ${_SP_EXTRA[*]:-(none)}${_SP_GEOM:+ | geometry: $_SP_GEOM}"
     echo "[2/3] Spirula training ($ITERS iterations, $TOTAL_FRAMES frames, ${_SP_MAXSIDE}px)..."
-    # --preview-every N: a checkpoint every N steps, each turned into a small preview .sog in $MODEL_DIR/preview
-    # (preview_watch.sh) for the phone to show while training runs (2026-10-28). Costs ~1 s of writing per save.
+    # --preview-every N: a checkpoint every N steps, each turned into a flat-colour preview .sog in $MODEL_DIR/preview
+    # (preview_watch.sh) for the phone to show while training runs (2026-10-28). Costs ~0.5 s of training per save.
     _SP_PREVIEW=(); _PW=""
     if [[ -n "${PREVIEW_EVERY:-}" ]]; then
         _SP_PREVIEW=(--steps-per-save "$PREVIEW_EVERY")
@@ -2031,7 +2031,8 @@ PYD
         --output-dir-prefix "$MODEL_DIR" --output-dir-name spirula_output \
         "${_SP_PREVIEW[@]}" "${_SP_EXTRA[@]}" \
         2>&1 | tee "$MODEL_DIR/02_train.log"
-    [[ -n $_PW ]] && kill "$_PW" 2>/dev/null
+    # The previews are only shown while training runs (server /live): drop them with the watcher.
+    [[ -n $_PW ]] && { kill "$_PW" 2>/dev/null; wait "$_PW" 2>/dev/null; rm -rf "$MODEL_DIR/preview"; }
     [[ -f "$SPIRULA_OUT/step-$(printf %09d "$ITERS").ckpt/splat.ply" ]] || { echo "Error: Spirula wrote no splat.ply for iter $ITERS in $SPIRULA_OUT"; exit 1; }
     # --scene-center none keeps the splats in the SfM's world frame; prove it, since every viewer and
     # /carpet read the PLY in that frame.
