@@ -224,8 +224,11 @@ def extract_sfm_metrics(sparse_dir: str) -> dict:
     try:
         import pycolmap
         rec = pycolmap.Reconstruction(sparse_dir)
-        if rec.num_points3D():
-            result["track_len_mean"] = round(rec.compute_mean_track_length(), 3)
+        # Over points WITH a track: a dense start adds stereo points that no photo observes (2026-10-27: 20,575 SfM
+        # points at 4.28 photos each read "0.24" once 350k stereo points sat in the same model).
+        tracks = [p.track.length() for p in rec.points3D.values() if p.track.length() > 0]
+        if tracks:
+            result["track_len_mean"] = round(sum(tracks) / len(tracks), 3)
             result["obs_per_image_mean"] = round(
                 rec.compute_mean_observations_per_reg_image(), 1)
     except Exception as e:
