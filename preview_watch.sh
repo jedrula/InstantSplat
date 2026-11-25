@@ -1,5 +1,5 @@
 #!/bin/bash
-# preview_watch.sh <spirula output dir> <preview dir> <final step> <trainer pid>: while Spirula trains, turn each
+# preview_watch.sh <spirula output dir> <preview dir> <final step> <trainer pid> [snapshot step]: while Spirula trains, turn each
 # checkpoint it saves (--steps-per-save) into a small preview .sog the phone can show as it comes (2026-10-28, Andrzej:
 # "stream reconstruction from the training at say every 1k iters ... show it on the phone to keep people engaged").
 # A preview is the checkpoint in flat colour (-H 0): ~3 s on the CPU so the training GPU is untouched, ~13 MB at 1M
@@ -7,8 +7,10 @@
 # -d took 60 s on the CPU (previews a minute late, steps skipped, training stalled up to 12 s while it ran) and keeping a
 # subset instead (opacity, footprint, random) lost 13-27 dB against the full splat (2026-10-28, run 7919560e). <preview dir>/preview.json names the newest: {"step", "of", "splats", "file", "at"};
 # only the newest .sog is kept. The final step is not previewed: the job's own .sog follows it.
+# [snapshot step]: that step's full splat is also kept, hard-linked (no second 700 MB at 3M splats) as
+# <preview dir>/../snapshot/step-<N>.ply - the recipe makes a viewable job of it (2026-11-25).
 set -uo pipefail
-OUT=$1; PV=$2; LAST=$3; PID=$4
+OUT=$1; PV=$2; LAST=$3; PID=$4; SNAP=${5:-0}
 ST=${PREVIEW_ST:-$HOME/tools/st3103/node_modules/.bin/splat-transform}
 MAX=${PREVIEW_MAX:-0}
 mkdir -p "$PV"
@@ -27,6 +29,8 @@ while kill -0 "$PID" 2>/dev/null; do
     [[ $s1 == "$s2" ]] || continue
     # Copy first: --save-only-latest-checkpoint deletes it once the next one is written.
     cp "$ply" "$PV/in.ply" 2>/dev/null || continue
+    (( step == SNAP )) && mkdir -p "$PV/../snapshot" && ln "$PV/in.ply" "$PV/../snapshot/step-$step.ply" \
+        && echo "    snapshot: step $step kept"
     n=$(head -c 4096 "$PV/in.ply" | grep -a -m1 "^element vertex" | awk '{print $3}')
     src="$PV/in.ply"
     if (( MAX > 0 && ${n:-0} > MAX )); then

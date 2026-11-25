@@ -291,6 +291,7 @@ while [[ $# -gt 0 ]]; do
         --sog-sh)       SOG_SH="$2";            shift 2 ;;
         --no-splat)     NO_SPLAT=1;             shift 1 ;;
         --preview-every) PREVIEW_EVERY="$2";    shift 2 ;;
+        --snapshot-at)  SNAPSHOT_AT="$2";      shift 2 ;;
         --fps-list)     FPS_LIST="$2";     shift 2 ;;
         --nframes-list) NFRAMES_LIST="$2"; shift 2 ;;
         --start-list)   START_LIST="$2";   shift 2 ;;
@@ -2015,11 +2016,18 @@ PYD
     echo "[2/3] Spirula training ($ITERS iterations, $TOTAL_FRAMES frames, ${_SP_MAXSIDE}px)..."
     # --preview-every N: a checkpoint every N steps, each turned into a flat-colour preview .sog in $MODEL_DIR/preview
     # (preview_watch.sh) for the phone to show while training runs (2026-10-28). Costs ~0.5 s of training per save.
-    _SP_PREVIEW=(); _PW=""
-    if [[ -n "${PREVIEW_EVERY:-}" ]]; then
-        _SP_PREVIEW=(--steps-per-save "$PREVIEW_EVERY")
-        rm -rf "$MODEL_DIR/preview"
-        bash "$HOME/workdir/InstantSplat/preview_watch.sh" "$SPIRULA_OUT" "$MODEL_DIR/preview" "$ITERS" $$ &
+    # --snapshot-at N: keep step N's splat as $MODEL_DIR/snapshot/step-N.ply (the same watcher hard-links it before
+    # Spirula deletes that checkpoint), for the recipe to make a job of: the 7k step of a 30k run, viewable beside the
+    # finished one (2026-11-25, Andrzej: "it already gives a great understanding on how good/bad it gets").
+    _SP_PREVIEW=(); _PW=""; _SNAP=0
+    [[ ${SNAPSHOT_AT:-0} -gt 0 && $SNAPSHOT_AT -lt $ITERS ]] && _SNAP=$SNAPSHOT_AT
+    if [[ -n "${PREVIEW_EVERY:-}" || $_SNAP -gt 0 ]]; then
+        # One save cadence serves both: previews every PREVIEW_EVERY, which must land on the snapshot step.
+        _EVERY=${PREVIEW_EVERY:-$_SNAP}
+        (( _SNAP == 0 || _SNAP % _EVERY == 0 )) || { echo "Error: --snapshot-at $_SNAP is not a multiple of --preview-every $_EVERY"; exit 1; }
+        _SP_PREVIEW=(--steps-per-save "$_EVERY")
+        rm -rf "$MODEL_DIR/preview" "$MODEL_DIR/snapshot"
+        bash "$HOME/workdir/InstantSplat/preview_watch.sh" "$SPIRULA_OUT" "$MODEL_DIR/preview" "$ITERS" $$ $_SNAP &
         _PW=$!
     fi
     "$SPIRULA_BIN" train 3dgs --data "$_SP_SCENE" \
@@ -2033,6 +2041,7 @@ PYD
         2>&1 | tee "$MODEL_DIR/02_train.log"
     # The previews are only shown while training runs (server /live): drop them with the watcher.
     [[ -n $_PW ]] && { kill "$_PW" 2>/dev/null; wait "$_PW" 2>/dev/null; rm -rf "$MODEL_DIR/preview"; }
+    (( _SNAP == 0 )) || [[ -f "$MODEL_DIR/snapshot/step-$_SNAP.ply" ]] || echo "    snapshot: step $_SNAP was not kept (the watcher missed it)"
     [[ -f "$SPIRULA_OUT/step-$(printf %09d "$ITERS").ckpt/splat.ply" ]] || { echo "Error: Spirula wrote no splat.ply for iter $ITERS in $SPIRULA_OUT"; exit 1; }
     # --scene-center none keeps the splats in the SfM's world frame; prove it, since every viewer and
     # /carpet read the PLY in that frame.
